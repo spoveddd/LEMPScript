@@ -1,14 +1,17 @@
 #!/bin/bash
 #=====================================================================
-# LEMP/LAMP Stack Automate
+# LEMP/LAMP Stack Automate Pro
 #=====================================================================
-# Автор: Павлович Владислав - pavlovich.live
+# Автор: Ваше Имя
 # Дата: 14 апреля 2025
-# Версия: 1.0.0
+# Версия: 2.0.0
 #
 # Описание: Этот скрипт автоматизирует развертывание и настройку
 # LEMP или LAMP стека с оптимизацией производительности и функциями
 # безопасности. Поддерживает дистрибутивы Ubuntu и CentOS.
+# Позволяет выбрать между различными конфигурациями, включая
+# Nginx+Apache в режиме прокси, и добавление новых сайтов в
+# существующую конфигурацию.
 #=====================================================================
 
 # Строгий режим выполнения
@@ -27,7 +30,8 @@ NC='\033[0m' # Без цвета
 LOG_FILE="/var/log/lemp_automate.log"
 
 # Переменные конфигурации со значениями по умолчанию
-WEB_SERVER="nginx"
+OPERATION="install" # install или add_site
+WEB_SERVER="nginx"  # nginx, apache или nginx_apache_proxy
 PHP_VERSION="8.2"
 DATABASE="mariadb"
 DB_VERSION=""
@@ -43,6 +47,7 @@ DB_PASS=""
 OS_TYPE=""
 PACKAGE_MANAGER=""
 SERVICE_MANAGER=""
+PHP_HANDLER="fpm" # fpm, fcgi или proxy
 
 #=====================================================================
 # Служебные функции
@@ -121,9 +126,9 @@ prompt_yes_no() {
     local answer
     
     if [[ "$default" == "y" ]]; then
-        prompt="${prompt} [Д/н]"
+        prompt="${prompt} [Y/n]"
     else
-        prompt="${prompt} [д/Н]"
+        prompt="${prompt} [y/N]"
     fi
     
     read -p "$prompt " answer
@@ -132,10 +137,163 @@ prompt_yes_no() {
         answer="$default"
     fi
     
-    if [[ ${answer,,} == "д" || ${answer,,} == "y" || ${answer,,} == "да" || ${answer,,} == "yes" ]]; then
+    if [[ ${answer,,} == "y" || ${answer,,} == "yes" ]]; then
         return 0 # true
     else
         return 1 # false
+    fi
+}
+
+#=====================================================================
+# Функции обнаружения установленного ПО
+#=====================================================================
+
+check_installed_webserver() {
+    log_info "Проверка установленного веб-сервера..."
+    
+    local nginx_installed=false
+    local apache_installed=false
+    
+    # Проверка Nginx
+    if command -v nginx &> /dev/null || [[ -d /etc/nginx ]]; then
+        nginx_installed=true
+        log_info "Обнаружен установленный Nginx"
+    fi
+    
+    # Проверка Apache
+    if command -v apache2 &> /dev/null || command -v httpd &> /dev/null || [[ -d /etc/apache2 ]] || [[ -d /etc/httpd ]]; then
+        apache_installed=true
+        log_info "Обнаружен установленный Apache"
+    fi
+    
+    # Определение текущей конфигурации
+    if $nginx_installed && $apache_installed; then
+        # Проверяем, используется ли Nginx как прокси для Apache
+        if grep -q "proxy_pass" /etc/nginx/sites-enabled/* 2>/dev/null || grep -q "proxy_pass" /etc/nginx/conf.d/* 2>/dev/null; then
+            log_info "Обнаружена конфигурация Nginx+Apache в режиме прокси"
+            WEB_SERVER="nginx_apache_proxy"
+        else
+            log_info "Обнаружены оба веб-сервера, но не в конфигурации прокси"
+            # Определяем, какой сервер активно используется (слушает порт 80)
+            if netstat -tulpn | grep ":80" | grep -q nginx; then
+                WEB_SERVER="nginx"
+            elif netstat -tulpn | grep ":80" | grep -q apache2 || netstat -tulpn | grep ":80" | grep -q httpd; then
+                WEB_SERVER="apache"
+            else
+                # По умолчанию выбираем Nginx, если оба установлены, но порт 80 не прослушивается
+                WEB_SERVER="nginx"
+            fi
+        fi
+    elif $nginx_installed; then
+        WEB_SERVER="nginx"
+    elif $apache_installed; then
+        WEB_SERVER="apache"
+    else
+        WEB_SERVER="" # Не установлен ни один веб-сервер
+    fi
+    
+    # Возвращаем статус наличия установленного веб-сервера
+    if [[ -n "$WEB_SERVER" ]]; then
+        return 0 # true - веб-сервер установлен
+    else
+        return 1 # false - веб-сервер не установлен
+    fi
+}
+
+check_installed_php() {
+    log_info "Проверка установленного PHP..."
+    
+    # Проверка наличия PHP и определение версии
+    if command -v php &> /dev/null; then
+        local php_detected_version=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+        PHP_VERSION=$php_detected_version
+        log_info "Обнаружен установленный PHP версии $PHP_VERSION"
+        
+        # Определение типа обработчика PHP
+        if systemctl is-active --quiet php${PHP_VERSION}-fpm || systemctl is-active --quiet php-fpm; then
+            PHP_HANDLER="fpm"
+            log_info "Обнаружен PHP-FPM"
+        elif [[ -d /etc/php/${PHP_VERSION}/cgi ]] || [[ -d /etc/php/cgi ]]; then
+            PHP_HANDLER="fcgi"
+            log_info "Обнаружен PHP-FCGI"
+        else
+            PHP_HANDLER="mod_php"
+            log_info "Обнаружен mod_php (Apache)"
+        fi
+        
+        return 0 # true - PHP установлен
+    else
+        PHP_VERSION="8.2" # Значение по умолчанию, если PHP не установлен
+        PHP_HANDLER="fpm" # Значение по умолчанию, если PHP не установлен
+        return 1 # false - PHP не установлен
+    fi
+}
+
+check_installed_database() {
+    log_info "Проверка установленной базы данных..."
+    
+    local mysql_installed=false
+    local mariadb_installed=false
+    
+    # Проверка MySQL
+    if command -v mysql &> /dev/null && ! mysql --version | grep -q MariaDB; then
+        mysql_installed=true
+        log_info "Обнаружен установленный MySQL"
+    fi
+    
+    # Проверка MariaDB
+    if command -v mariadb &> /dev/null || (command -v mysql &> /dev/null && mysql --version | grep -q MariaDB); then
+        mariadb_installed=true
+        log_info "Обнаружен установленный MariaDB"
+    fi
+    
+    # Определение текущей СУБД
+    if $mariadb_installed; then
+        DATABASE="mariadb"
+        # Определение версии MariaDB
+        if command -v mysql &> /dev/null; then
+            DB_VERSION=$(mysql --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | cut -d. -f1,2)
+            log_info "Версия MariaDB: $DB_VERSION"
+        fi
+    elif $mysql_installed; then
+        DATABASE="mysql"
+        # Определение версии MySQL
+        if command -v mysql &> /dev/null; then
+            DB_VERSION=$(mysql --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | cut -d. -f1,2)
+            log_info "Версия MySQL: $DB_VERSION"
+        fi
+    else
+        DATABASE="mariadb" # Значение по умолчанию, если база данных не установлена
+        DB_VERSION="" # Значение по умолчанию, если база данных не установлена
+    fi
+    
+    # Возвращаем статус наличия установленной базы данных
+    if $mysql_installed || $mariadb_installed; then
+        return 0 # true - база данных установлена
+    else
+        return 1 # false - база данных не установлена
+    fi
+}
+
+detect_installed_software() {
+    log_info "Проверка установленного программного обеспечения..."
+    
+    local webserver_installed=false
+    local php_installed=false
+    local database_installed=false
+    
+    # Проверка компонентов
+    check_installed_webserver && webserver_installed=true
+    check_installed_php && php_installed=true
+    check_installed_database && database_installed=true
+    
+    # Определение доступных операций
+    if $webserver_installed && $php_installed && $database_installed; then
+        log_info "Обнаружен полностью установленный стек"
+        return 0 # true - стек установлен
+    else
+        log_info "Стек не установлен полностью"
+        return 1 # false - стек не установлен полностью
     fi
 }
 
@@ -214,16 +372,39 @@ install_php() {
             apt update
         fi
         
-        # Установка PHP и основных модулей
-        apt install -y php${PHP_VERSION} php${PHP_VERSION}-fpm php${PHP_VERSION}-common php${PHP_VERSION}-mysql \
-            php${PHP_VERSION}-xml php${PHP_VERSION}-xmlrpc php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
-            php${PHP_VERSION}-imagick php${PHP_VERSION}-cli php${PHP_VERSION}-dev php${PHP_VERSION}-imap \
-            php${PHP_VERSION}-mbstring php${PHP_VERSION}-opcache php${PHP_VERSION}-soap php${PHP_VERSION}-zip \
-            php${PHP_VERSION}-intl
+        # Выбор пакетов в зависимости от обработчика PHP
+        if [[ "$PHP_HANDLER" == "fpm" ]]; then
+            # Установка PHP-FPM
+            apt install -y php${PHP_VERSION} php${PHP_VERSION}-fpm php${PHP_VERSION}-common php${PHP_VERSION}-mysql \
+                php${PHP_VERSION}-xml php${PHP_VERSION}-xmlrpc php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
+                php${PHP_VERSION}-imagick php${PHP_VERSION}-cli php${PHP_VERSION}-dev php${PHP_VERSION}-imap \
+                php${PHP_VERSION}-mbstring php${PHP_VERSION}-opcache php${PHP_VERSION}-soap php${PHP_VERSION}-zip \
+                php${PHP_VERSION}-intl
+                
+            # Запуск и включение PHP-FPM
+            $SERVICE_MANAGER start php${PHP_VERSION}-fpm
+            $SERVICE_MANAGER enable php${PHP_VERSION}-fpm
             
-        # Запуск и включение PHP-FPM
-        $SERVICE_MANAGER start php${PHP_VERSION}-fpm
-        $SERVICE_MANAGER enable php${PHP_VERSION}-fpm
+        elif [[ "$PHP_HANDLER" == "fcgi" ]]; then
+            # Установка PHP-CGI
+            apt install -y php${PHP_VERSION} php${PHP_VERSION}-cgi php${PHP_VERSION}-common php${PHP_VERSION}-mysql \
+                php${PHP_VERSION}-xml php${PHP_VERSION}-xmlrpc php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
+                php${PHP_VERSION}-imagick php${PHP_VERSION}-cli php${PHP_VERSION}-dev php${PHP_VERSION}-imap \
+                php${PHP_VERSION}-mbstring php${PHP_VERSION}-opcache php${PHP_VERSION}-soap php${PHP_VERSION}-zip \
+                php${PHP_VERSION}-intl
+                
+        elif [[ "$PHP_HANDLER" == "mod_php" ]]; then
+            # Установка модуля PHP для Apache
+            apt install -y php${PHP_VERSION} libapache2-mod-php${PHP_VERSION} php${PHP_VERSION}-common php${PHP_VERSION}-mysql \
+                php${PHP_VERSION}-xml php${PHP_VERSION}-xmlrpc php${PHP_VERSION}-curl php${PHP_VERSION}-gd \
+                php${PHP_VERSION}-imagick php${PHP_VERSION}-cli php${PHP_VERSION}-dev php${PHP_VERSION}-imap \
+                php${PHP_VERSION}-mbstring php${PHP_VERSION}-opcache php${PHP_VERSION}-soap php${PHP_VERSION}-zip \
+                php${PHP_VERSION}-intl
+                
+            # Активация модуля PHP в Apache
+            a2enmod php${PHP_VERSION}
+            $SERVICE_MANAGER restart apache2
+        fi
         
     elif [[ "$OS_TYPE" == "rhel" ]]; then
         # Добавление репозитория Remi для PHP
@@ -231,16 +412,32 @@ install_php() {
         yum module reset php -y
         yum module enable php:remi-${PHP_VERSION} -y
         
-        # Установка PHP и основных модулей
-        yum install -y php php-fpm php-common php-mysqlnd php-xml php-xmlrpc php-curl php-gd \
-            php-imagick php-cli php-devel php-imap php-mbstring php-opcache php-soap php-zip php-intl
+        # Выбор пакетов в зависимости от обработчика PHP
+        if [[ "$PHP_HANDLER" == "fpm" ]]; then
+            # Установка PHP-FPM
+            yum install -y php php-fpm php-common php-mysqlnd php-xml php-xmlrpc php-curl php-gd \
+                php-imagick php-cli php-devel php-imap php-mbstring php-opcache php-soap php-zip php-intl
+                
+            # Запуск и включение PHP-FPM
+            $SERVICE_MANAGER start php-fpm
+            $SERVICE_MANAGER enable php-fpm
             
-        # Запуск и включение PHP-FPM
-        $SERVICE_MANAGER start php-fpm
-        $SERVICE_MANAGER enable php-fpm
+        elif [[ "$PHP_HANDLER" == "fcgi" ]]; then
+            # Установка PHP-CGI
+            yum install -y php php-common php-mysqlnd php-xml php-xmlrpc php-curl php-gd \
+                php-imagick php-cli php-devel php-imap php-mbstring php-opcache php-soap php-zip php-intl
+                
+        elif [[ "$PHP_HANDLER" == "mod_php" ]]; then
+            # Установка модуля PHP для Apache
+            yum install -y php php-common php-mysqlnd php-xml php-xmlrpc php-curl php-gd \
+                php-imagick php-cli php-devel php-imap php-mbstring php-opcache php-soap php-zip php-intl
+                
+            # Перезапуск Apache
+            $SERVICE_MANAGER restart httpd
+        fi
     fi
     
-    log_success "PHP ${PHP_VERSION} успешно установлен"
+    log_success "PHP ${PHP_VERSION} успешно установлен с обработчиком ${PHP_HANDLER}"
 }
 
 install_mysql() {
@@ -348,6 +545,65 @@ EOF
     log_success "MariaDB успешно установлен"
 }
 
+# Настройка Nginx в качестве прокси для Apache
+configure_nginx_apache_proxy() {
+    log_info "Настройка Nginx в качестве прокси для Apache..."
+    
+    # Проверка, установлены ли Nginx и Apache
+    if ! command -v nginx &> /dev/null; then
+        log_error "Nginx не установлен. Невозможно настроить прокси."
+        return 1
+    fi
+    
+    if ! command -v apache2 &> /dev/null && ! command -v httpd &> /dev/null; then
+        log_error "Apache не установлен. Невозможно настроить прокси."
+        return 1
+    fi
+    
+    # Настройка Apache для прослушивания на локальном порту 8080
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        # Изменение порта в Apache
+        sed -i 's/Listen 80/Listen 127.0.0.1:8080/g' /etc/apache2/ports.conf
+        
+        # Перезапуск Apache
+        $SERVICE_MANAGER restart apache2
+    elif [[ "$OS_TYPE" == "rhel" ]]; then
+        # Изменение порта в Apache
+        sed -i 's/Listen 80/Listen 127.0.0.1:8080/g' /etc/httpd/conf/httpd.conf
+        
+        # Перезапуск Apache
+        $SERVICE_MANAGER restart httpd
+    fi
+    
+    # Настройка Nginx для проксирования запросов в Apache
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        cat > /etc/nginx/conf.d/proxy.conf << EOF
+# Настройки проксирования для Apache
+proxy_connect_timeout 60s;
+proxy_send_timeout 60s;
+proxy_read_timeout 60s;
+proxy_buffering on;
+proxy_buffer_size 8k;
+proxy_buffers 8 8k;
+EOF
+    elif [[ "$OS_TYPE" == "rhel" ]]; then
+        cat > /etc/nginx/conf.d/proxy.conf << EOF
+# Настройки проксирования для Apache
+proxy_connect_timeout 60s;
+proxy_send_timeout 60s;
+proxy_read_timeout 60s;
+proxy_buffering on;
+proxy_buffer_size 8k;
+proxy_buffers 8 8k;
+EOF
+    fi
+    
+    # Перезапуск Nginx
+    $SERVICE_MANAGER restart nginx
+    
+    log_success "Nginx настроен в качестве прокси для Apache"
+}
+
 configure_database() {
     log_info "Настройка базы данных..."
     
@@ -390,7 +646,7 @@ EOF
         log_info "Создание базы данных $DB_NAME и пользователя $DB_USER..."
         
         $db_cmd -u root -p"$DB_PASS" <<EOF
-CREATE DATABASE IF NOT EXISTS $DB_NAME;
+CREATE DATABASE IF NOT EXISTS $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
 GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
@@ -409,7 +665,9 @@ configure_nginx() {
     fi
     
     # Создание конфигурации сайта
-    cat > /etc/nginx/sites-available/$DOMAIN.conf << EOF
+    if [[ "$WEB_SERVER" == "nginx" ]]; then
+        # Стандартная конфигурация Nginx с PHP-FPM
+        cat > /etc/nginx/sites-available/$DOMAIN.conf << EOF
 server {
     listen 80;
     listen [::]:80;
@@ -441,6 +699,8 @@ server {
     add_header X-XSS-Protection "1; mode=block" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()" always;
     
     # Запрет доступа к скрытым файлам
     location ~ /\.(?!well-known) {
@@ -465,6 +725,64 @@ server {
     error_log /var/log/nginx/${DOMAIN}_error.log;
 }
 EOF
+    elif [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        # Конфигурация Nginx как прокси для Apache
+        cat > /etc/nginx/sites-available/$DOMAIN.conf << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} www.${DOMAIN};
+    
+    access_log /var/log/nginx/${DOMAIN}_access.log;
+    error_log /var/log/nginx/${DOMAIN}_error.log;
+    
+    # Статические файлы обслуживаются Nginx для повышения производительности
+    location ~* \.(jpg|jpeg|gif|png|css|js|ico|xml)$ {
+        root ${SITE_DIR};
+        expires 30d;
+        add_header Cache-Control "public, no-transform";
+    }
+    
+    # Запрет доступа к скрытым файлам
+    location ~ /\.(?!well-known) {
+        deny all;
+    }
+    
+    # Все остальные запросы проксируются в Apache
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # Настройки проксирования
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # Буферизация для повышения производительности
+        proxy_buffering on;
+        proxy_buffer_size 16k;
+        proxy_buffers 16 16k;
+    }
+    
+    # Заголовки безопасности
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+    add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';" always;
+    
+    # Включение сжатия gzip
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1000;
+    gzip_proxied any;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+}
+EOF
+    fi
     
     # Создание символической ссылки для активации сайта
     if [[ -d /etc/nginx/sites-enabled ]]; then
@@ -474,6 +792,9 @@ EOF
         if [[ -f /etc/nginx/sites-enabled/default ]]; then
             rm -f /etc/nginx/sites-enabled/default
         fi
+    elif [[ -d /etc/nginx/conf.d ]]; then
+        # Для систем без sites-enabled (например, CentOS)
+        ln -sf /etc/nginx/sites-available/$DOMAIN.conf /etc/nginx/conf.d/$DOMAIN.conf
     fi
     
     # Создание директории сайта, если она не существует
@@ -492,7 +813,7 @@ EOF
 EOF
     
     # Установка правильных прав доступа
-    chown -R www-data:www-data ${SITE_DIR}
+    chown -R www-data:www-data ${SITE_DIR} || chown -R nginx:nginx ${SITE_DIR}
     
     # Проверка конфигурации Nginx
     nginx -t
@@ -510,7 +831,9 @@ configure_apache() {
     if [[ "$OS_TYPE" == "debian" ]]; then
         conf_file="/etc/apache2/sites-available/$DOMAIN.conf"
         
-        cat > $conf_file << EOF
+        if [[ "$WEB_SERVER" == "apache" ]]; then
+            # Стандартная конфигурация Apache
+            cat > $conf_file << EOF
 <VirtualHost *:80>
     ServerName ${DOMAIN}
     ServerAlias www.${DOMAIN}
@@ -521,17 +844,27 @@ configure_apache() {
         AllowOverride All
         Require all granted
     </Directory>
+EOF
+
+            if [[ "$PHP_HANDLER" == "fpm" ]]; then
+                # Конфигурация для PHP-FPM
+                cat >> $conf_file << EOF
     
-    # Конфигурация PHP
+    # PHP-FPM Configuration
     <FilesMatch \.php$>
         SetHandler "proxy:unix:/var/run/php/php${PHP_VERSION}-fpm.sock|fcgi://localhost"
     </FilesMatch>
+EOF
+            fi
+
+            cat >> $conf_file << EOF
     
     # Заголовки безопасности
     Header set X-Frame-Options "SAMEORIGIN"
     Header set X-XSS-Protection "1; mode=block"
     Header set X-Content-Type-Options "nosniff"
     Header set Referrer-Policy "no-referrer-when-downgrade"
+    Header set Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';"
     
     # Включение сжатия gzip
     <IfModule mod_deflate.c>
@@ -554,18 +887,63 @@ configure_apache() {
     CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
 </VirtualHost>
 EOF
+        elif [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+            # Конфигурация Apache за Nginx прокси
+            cat > $conf_file << EOF
+<VirtualHost 127.0.0.1:8080>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot ${SITE_DIR}
+    
+    <Directory ${SITE_DIR}>
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+EOF
+
+            if [[ "$PHP_HANDLER" == "fpm" ]]; then
+                # Конфигурация для PHP-FPM
+                cat >> $conf_file << EOF
+    
+    # PHP-FPM Configuration
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/var/run/php/php${PHP_VERSION}-fpm.sock|fcgi://localhost"
+    </FilesMatch>
+EOF
+            fi
+
+            cat >> $conf_file << EOF
+    
+    # Настройки для прокси
+    UseCanonicalName Off
+    
+    # Настройки логирования
+    ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}_error.log
+    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
+    
+    # Запись заголовков X-Forwarded в логи
+    LogFormat "%{X-Forwarded-For}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-agent}i\"" proxy
+    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_proxy.log proxy
+</VirtualHost>
+EOF
+        fi
         
         # Включение необходимых модулей
-        a2enmod rewrite headers expires deflate proxy_fcgi
+        a2enmod rewrite headers expires deflate
+        if [[ "$PHP_HANDLER" == "fpm" ]]; then
+            a2enmod proxy_fcgi
+        fi
         
         # Включение сайта и отключение сайта по умолчанию
         a2ensite $DOMAIN.conf
         a2dissite 000-default.conf
         
     elif [[ "$OS_TYPE" == "rhel" ]]; then
-        conf_file="/etc/httpd/conf.d/$DOMAIN.conf"
-        
-        cat > $conf_file << EOF
+        if [[ "$WEB_SERVER" == "apache" ]]; then
+            conf_file="/etc/httpd/conf.d/$DOMAIN.conf"
+            
+            cat > $conf_file << EOF
 <VirtualHost *:80>
     ServerName ${DOMAIN}
     ServerAlias www.${DOMAIN}
@@ -576,17 +954,27 @@ EOF
         AllowOverride All
         Require all granted
     </Directory>
+EOF
+
+            if [[ "$PHP_HANDLER" == "fpm" ]]; then
+                # Конфигурация для PHP-FPM
+                cat >> $conf_file << EOF
     
-    # Конфигурация PHP
+    # PHP-FPM Configuration
     <FilesMatch \.php$>
         SetHandler "proxy:fcgi://127.0.0.1:9000"
     </FilesMatch>
+EOF
+            fi
+
+            cat >> $conf_file << EOF
     
     # Заголовки безопасности
     Header set X-Frame-Options "SAMEORIGIN"
     Header set X-XSS-Protection "1; mode=block"
     Header set X-Content-Type-Options "nosniff"
     Header set Referrer-Policy "no-referrer-when-downgrade"
+    Header set Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';"
     
     # Включение сжатия gzip
     <IfModule mod_deflate.c>
@@ -609,6 +997,48 @@ EOF
     CustomLog /var/log/httpd/${DOMAIN}_access.log combined
 </VirtualHost>
 EOF
+        elif [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+            conf_file="/etc/httpd/conf.d/$DOMAIN.conf"
+            
+            cat > $conf_file << EOF
+<VirtualHost 127.0.0.1:8080>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot ${SITE_DIR}
+    
+    <Directory ${SITE_DIR}>
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+EOF
+
+            if [[ "$PHP_HANDLER" == "fpm" ]]; then
+                # Конфигурация для PHP-FPM
+                cat >> $conf_file << EOF
+    
+    # PHP-FPM Configuration
+    <FilesMatch \.php$>
+        SetHandler "proxy:fcgi://127.0.0.1:9000"
+    </FilesMatch>
+EOF
+            fi
+
+            cat >> $conf_file << EOF
+    
+    # Настройки для прокси
+    UseCanonicalName Off
+    
+    # Настройки логирования
+    ErrorLog /var/log/httpd/${DOMAIN}_error.log
+    CustomLog /var/log/httpd/${DOMAIN}_access.log combined
+    
+    # Запись заголовков X-Forwarded в логи
+    LogFormat "%{X-Forwarded-For}i %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-agent}i\"" proxy
+    CustomLog /var/log/httpd/${DOMAIN}_proxy.log proxy
+</VirtualHost>
+EOF
+        fi
         
         # Включение необходимых модулей
         for mod in rewrite headers expires deflate proxy_fcgi; do
@@ -655,7 +1085,13 @@ configure_php() {
     
     local php_ini
     if [[ "$OS_TYPE" == "debian" ]]; then
-        php_ini="/etc/php/${PHP_VERSION}/fpm/php.ini"
+        if [[ "$PHP_HANDLER" == "fpm" ]]; then
+            php_ini="/etc/php/${PHP_VERSION}/fpm/php.ini"
+        elif [[ "$PHP_HANDLER" == "fcgi" ]]; then
+            php_ini="/etc/php/${PHP_VERSION}/cgi/php.ini"
+        else
+            php_ini="/etc/php/${PHP_VERSION}/apache2/php.ini"
+        fi
     elif [[ "$OS_TYPE" == "rhel" ]]; then
         php_ini="/etc/php.ini"
     fi
@@ -668,6 +1104,7 @@ configure_php() {
     sed -i 's/upload_max_filesize = .*/upload_max_filesize = 64M/' $php_ini
     sed -i 's/post_max_size = .*/post_max_size = 64M/' $php_ini
     sed -i 's/max_execution_time = .*/max_execution_time = 300/' $php_ini
+    sed -i 's/max_input_time = .*/max_input_time = 300/' $php_ini
     sed -i 's/;opcache.enable=.*/opcache.enable=1/' $php_ini
     sed -i 's/;opcache.memory_consumption=.*/opcache.memory_consumption=128/' $php_ini
     sed -i 's/;opcache.interned_strings_buffer=.*/opcache.interned_strings_buffer=8/' $php_ini
@@ -675,11 +1112,39 @@ configure_php() {
     sed -i 's/;opcache.revalidate_freq=.*/opcache.revalidate_freq=60/' $php_ini
     sed -i 's/;opcache.fast_shutdown=.*/opcache.fast_shutdown=1/' $php_ini
     
-    # Перезапуск PHP-FPM
-    if [[ "$OS_TYPE" == "debian" ]]; then
-        $SERVICE_MANAGER restart php${PHP_VERSION}-fpm
-    elif [[ "$OS_TYPE" == "rhel" ]]; then
-        $SERVICE_MANAGER restart php-fpm
+    # Настройка PHP-FPM для лучшей производительности (если используется)
+    if [[ "$PHP_HANDLER" == "fpm" ]]; then
+        local fpm_conf
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            fpm_conf="/etc/php/${PHP_VERSION}/fpm/pool.d/www.conf"
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            fpm_conf="/etc/php-fpm.d/www.conf"
+        fi
+        
+        # Резервное копирование оригинальной конфигурации
+        cp $fpm_conf ${fpm_conf}.bak
+        
+        # Оптимизация PHP-FPM
+        sed -i 's/^pm = .*/pm = dynamic/' $fpm_conf
+        sed -i 's/^pm.max_children = .*/pm.max_children = 50/' $fpm_conf
+        sed -i 's/^pm.start_servers = .*/pm.start_servers = 5/' $fpm_conf
+        sed -i 's/^pm.min_spare_servers = .*/pm.min_spare_servers = 5/' $fpm_conf
+        sed -i 's/^pm.max_spare_servers = .*/pm.max_spare_servers = 35/' $fpm_conf
+        sed -i 's/^;pm.max_requests = .*/pm.max_requests = 500/' $fpm_conf
+        
+        # Перезапуск PHP-FPM
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            $SERVICE_MANAGER restart php${PHP_VERSION}-fpm
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            $SERVICE_MANAGER restart php-fpm
+        fi
+    elif [[ "$PHP_HANDLER" == "mod_php" ]]; then
+        # Перезапуск Apache для применения изменений в php.ini
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            $SERVICE_MANAGER restart apache2
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            $SERVICE_MANAGER restart httpd
+        fi
     fi
     
     log_success "PHP успешно оптимизирован"
@@ -726,9 +1191,9 @@ EOF
     
     # Перезапуск службы базы данных
     if [[ "$DATABASE" == "mysql" ]]; then
-        $SERVICE_MANAGER restart mysql
+        $SERVICE_MANAGER restart mysql || $SERVICE_MANAGER restart mysqld
     else
-        $SERVICE_MANAGER restart mariadb
+        $SERVICE_MANAGER restart mariadb || $SERVICE_MANAGER restart mysql
     fi
     
     log_success "Производительность базы данных оптимизирована"
@@ -798,6 +1263,12 @@ enabled = true
 
 [nginx-http-auth]
 enabled = true
+
+[apache-auth]
+enabled = true
+
+[php-url-fopen]
+enabled = true
 EOF
     
     # Перезапуск Fail2Ban
@@ -810,24 +1281,30 @@ EOF
 setup_ssl() {
     log_info "Настройка SSL с Certbot..."
     
+    # Проверка, что домен не является localhost
+    if [[ "$DOMAIN" == "localhost" ]]; then
+        log_warning "SSL не может быть настроен для localhost"
+        return 1
+    fi
+    
     # Установка Certbot
     if [[ "$OS_TYPE" == "debian" ]]; then
         apt install -y certbot
         
-        if [[ "$WEB_SERVER" == "nginx" ]]; then
+        if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
             apt install -y python3-certbot-nginx
             certbot --nginx -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email admin@${DOMAIN}
-        else
+        elif [[ "$WEB_SERVER" == "apache" ]]; then
             apt install -y python3-certbot-apache
             certbot --apache -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email admin@${DOMAIN}
         fi
     elif [[ "$OS_TYPE" == "rhel" ]]; then
         yum install -y certbot
         
-        if [[ "$WEB_SERVER" == "nginx" ]]; then
+        if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
             yum install -y python3-certbot-nginx
             certbot --nginx -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email admin@${DOMAIN}
-        else
+        elif [[ "$WEB_SERVER" == "apache" ]]; then
             yum install -y python3-certbot-apache
             certbot --apache -d ${DOMAIN} -d www.${DOMAIN} --non-interactive --agree-tos --email admin@${DOMAIN}
         fi
@@ -843,7 +1320,7 @@ setup_swap() {
     log_info "Настройка файла подкачки (swap) размером ${SWAP_SIZE}..."
     
     # Проверка, существует ли уже swap
-    if free | grep -q 'Swap'; then
+    if free | grep -q 'Swap' && [[ $(free | grep 'Swap' | awk '{print $2}') -gt 0 ]]; then
         log_warning "Swap уже сконфигурирован. Пропускаем этот шаг."
         return
     fi
@@ -868,11 +1345,13 @@ setup_swap() {
 disable_directory_listing() {
     log_info "Отключение листинга директорий..."
     
-    if [[ "$WEB_SERVER" == "nginx" ]]; then
+    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
         # Для Nginx
         find /etc/nginx -type f -name "*.conf" -exec sed -i 's/autoindex on/autoindex off/g' {} \;
         $SERVICE_MANAGER reload nginx
-    else
+    fi
+    
+    if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
         # Для Apache
         if [[ "$OS_TYPE" == "debian" ]]; then
             find /etc/apache2 -type f -name "*.conf" -exec sed -i 's/Options Indexes/Options/g' {} \;
@@ -884,6 +1363,261 @@ disable_directory_listing() {
     fi
     
     log_success "Листинг директорий успешно отключен"
+}
+
+enhance_security() {
+    log_info "Настройка дополнительных мер безопасности..."
+    
+    # 1. Настройка защиты от брутфорс-атак с помощью fail2ban
+    setup_fail2ban
+    
+    # 2. Усиление безопасности SSH (если существует)
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        log_info "Настройка безопасности SSH..."
+        
+        # Создание резервной копии
+        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+        
+        # Отключение SSH-доступа для root
+        sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/g' /etc/ssh/sshd_config
+        sed -i 's/^PermitRootLogin yes/PermitRootLogin no/g' /etc/ssh/sshd_config
+        
+        # Отключение аутентификации по паролю, если есть ключи
+        if [[ -d /root/.ssh ]] || compgen -G "/home/*/.ssh" > /dev/null; then
+            if prompt_yes_no "Обнаружены SSH-ключи. Отключить аутентификацию по паролю (повышает безопасность, но доступ будет только по ключу)?" "n"; then
+                sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
+                sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config
+                log_info "Аутентификация по паролю для SSH отключена"
+            fi
+        fi
+        
+        # Перезапуск SSH для применения изменений
+        $SERVICE_MANAGER restart sshd
+        
+        log_success "Безопасность SSH настроена"
+    fi
+    
+    # 3. Настройка файловых прав для повышения безопасности
+    log_info "Настройка файловых прав..."
+    
+    # Исправление прав доступа к важным файлам конфигурации
+    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        find /etc/nginx -type f -name "*.conf" -exec chmod 640 {} \;
+    fi
+    
+    if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            find /etc/apache2 -type f -name "*.conf" -exec chmod 640 {} \;
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            find /etc/httpd -type f -name "*.conf" -exec chmod 640 {} \;
+        fi
+    fi
+    
+    # Защита конфигурации PHP
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        find /etc/php -type f -name "*.ini" -exec chmod 640 {} \;
+    elif [[ "$OS_TYPE" == "rhel" ]]; then
+        chmod 640 /etc/php.ini
+        find /etc/php.d -type f -name "*.ini" -exec chmod 640 {} \; 2>/dev/null || true
+    fi
+    
+    # 4. Защита от XSS и других веб-атак
+    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        log_info "Настройка дополнительных заголовков безопасности для Nginx..."
+        
+        # Создание файла с дополнительными заголовками безопасности
+        cat > /etc/nginx/conf.d/security-headers.conf << EOF
+# Дополнительные заголовки безопасности
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "no-referrer-when-downgrade" always;
+add_header Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()" always;
+EOF
+
+        # Перезагрузка Nginx для применения изменений
+        $SERVICE_MANAGER reload nginx
+    fi
+    
+    if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        log_info "Настройка дополнительных заголовков безопасности для Apache..."
+        
+        # Создание файла с дополнительными заголовками безопасности
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            headers_file="/etc/apache2/conf-available/security-headers.conf"
+            
+            cat > $headers_file << EOF
+<IfModule mod_headers.c>
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-XSS-Protection "1; mode=block"
+    Header set X-Content-Type-Options "nosniff"
+    Header set Referrer-Policy "no-referrer-when-downgrade"
+    Header set Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';"
+    Header set Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+</IfModule>
+EOF
+            
+            # Включение конфигурации
+            a2enconf security-headers
+            
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            headers_file="/etc/httpd/conf.d/security-headers.conf"
+            
+            cat > $headers_file << EOF
+<IfModule mod_headers.c>
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-XSS-Protection "1; mode=block"
+    Header set X-Content-Type-Options "nosniff"
+    Header set Referrer-Policy "no-referrer-when-downgrade"
+    Header set Content-Security-Policy "default-src 'self' http: https: data: blob: 'unsafe-inline'; frame-ancestors 'self';"
+    Header set Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+</IfModule>
+EOF
+        fi
+        
+        # Перезапуск Apache для применения изменений
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            $SERVICE_MANAGER restart apache2
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            $SERVICE_MANAGER restart httpd
+        fi
+    fi
+    
+    # 5. Защита базы данных
+    log_info "Настройка дополнительной защиты базы данных..."
+    
+    # Настройка разрешений на прослушивание только локальных соединений
+    if [[ "$DATABASE" == "mysql" ]]; then
+        local my_cnf
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            my_cnf="/etc/mysql/mysql.conf.d/mysqld.cnf"
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            my_cnf="/etc/my.cnf"
+        fi
+        
+        # Проверяем, существует ли параметр bind-address
+        if grep -q "bind-address" $my_cnf; then
+            sed -i 's/^bind-address.*/bind-address = 127.0.0.1/' $my_cnf
+        else
+            echo "bind-address = 127.0.0.1" >> $my_cnf
+        fi
+        
+        # Перезапуск MySQL
+        $SERVICE_MANAGER restart mysql || $SERVICE_MANAGER restart mysqld
+        
+    elif [[ "$DATABASE" == "mariadb" ]]; then
+        local my_cnf
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            my_cnf="/etc/mysql/mariadb.conf.d/50-server.cnf"
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            my_cnf="/etc/my.cnf.d/server.cnf"
+        fi
+        
+        # Проверяем, существует ли параметр bind-address
+        if grep -q "bind-address" $my_cnf; then
+            sed -i 's/^bind-address.*/bind-address = 127.0.0.1/' $my_cnf
+        else
+            echo "bind-address = 127.0.0.1" >> $my_cnf
+        fi
+        
+        # Перезапуск MariaDB
+        $SERVICE_MANAGER restart mariadb || $SERVICE_MANAGER restart mysql
+    fi
+    
+    # 6. Настройка защиты от DDoS-атак для Nginx
+    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        setup_nginx_dos_protection
+    fi
+    
+    log_success "Дополнительные меры безопасности настроены"
+}
+
+# Дополнительная настройка защиты от DDoS для Nginx
+setup_nginx_dos_protection() {
+    log_info "Настройка защиты от DoS-атак для Nginx..."
+    
+    # Создание файла конфигурации ограничений
+    cat > /etc/nginx/conf.d/rate-limiting.conf << EOF
+# Ограничение количества запросов
+limit_req_zone \$binary_remote_addr zone=one:10m rate=1r/s;
+limit_req_zone \$binary_remote_addr zone=two:10m rate=10r/s;
+
+# Ограничение количества соединений
+limit_conn_zone \$binary_remote_addr zone=addr:10m;
+
+# Настройки по умолчанию для всех серверов
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    
+    # Ограничение размера тела запроса
+    client_max_body_size 10m;
+    
+    # Ограничение времени чтения тела запроса
+    client_body_timeout 10s;
+    
+    # Ограничение времени чтения заголовков запроса
+    client_header_timeout 10s;
+    
+    # Ограничение времени отправки ответа клиенту
+    send_timeout 10s;
+    
+    # Ограничение количества соединений с одного IP
+    limit_conn addr 15;
+    
+    # Возвращаем 444 для неизвестных виртуальных хостов
+    return 444;
+}
+EOF
+    
+    # Добавление настроек в шаблон конфигурации виртуального хоста
+    cat > /etc/nginx/snippets/rate-limiting.conf << EOF
+# Ограничение количества запросов к PHP файлам
+location ~ \.php$ {
+    limit_req zone=one burst=5 nodelay;
+    limit_req_status 429;
+    try_files \$uri =404;
+    # ... другие настройки PHP ...
+}
+
+# Ограничение количества запросов к динамичным ресурсам
+location ~ \.(php|asp|aspx|jsp|cgi)$ {
+    limit_req zone=one burst=5 nodelay;
+    limit_req_status 429;
+}
+
+# Ограничение количества запросов к статичным ресурсам
+location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg)$ {
+    limit_req zone=two burst=20 nodelay;
+    limit_req_status 429;
+    expires 30d;
+    add_header Cache-Control "public, no-transform";
+}
+
+# Защита от медленных запросов (Slowloris)
+client_body_timeout 10s;
+client_header_timeout 10s;
+keepalive_timeout 65s;
+send_timeout 10s;
+
+# Ограничение количества соединений с одного IP
+limit_conn addr 20;
+limit_conn_status 429;
+EOF
+    
+    # Добавление ссылки на конфигурацию в виртуальные хосты
+    for config in /etc/nginx/sites-available/*.conf; do
+        if [[ -f "$config" ]] && ! grep -q "include snippets/rate-limiting.conf;" "$config"; then
+            # Вставляем включение сниппета перед первым закрывающим "}"
+            sed -i '/}/i \    # Включение защиты от DDoS\n    include snippets/rate-limiting.conf;' "$config"
+        fi
+    done
+    
+    # Перезагрузка Nginx для применения изменений
+    $SERVICE_MANAGER reload nginx
+    
+    log_success "Защита от DoS-атак для Nginx настроена"
 }
 
 #=====================================================================
@@ -909,16 +1643,18 @@ uninstall_stack() {
     
     if [[ "$OS_TYPE" == "debian" ]]; then
         # Удаление веб-сервера
-        if [[ "$WEB_SERVER" == "nginx" ]]; then
+        if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
             apt purge -y nginx nginx-common
             rm -rf /etc/nginx
-        else
+        fi
+        
+        if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
             apt purge -y apache2 apache2-utils
             rm -rf /etc/apache2
         fi
         
         # Удаление PHP
-        apt purge -y php*
+        apt purge -y php* php*-fpm php*-common
         rm -rf /etc/php
         
         # Удаление базы данных
@@ -932,16 +1668,18 @@ uninstall_stack() {
         
     elif [[ "$OS_TYPE" == "rhel" ]]; then
         # Удаление веб-сервера
-        if [[ "$WEB_SERVER" == "nginx" ]]; then
+        if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
             yum remove -y nginx
             rm -rf /etc/nginx
-        else
+        fi
+        
+        if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
             yum remove -y httpd
             rm -rf /etc/httpd
         fi
         
         # Удаление PHP
-        yum remove -y php*
+        yum remove -y php* php-fpm
         rm -rf /etc/php.d /etc/php-fpm.d
         
         # Удаление базы данных
@@ -954,6 +1692,13 @@ uninstall_stack() {
         fi
     fi
     
+    # Удаление swap-файла, если он был создан скриптом
+    if [[ -f /swapfile ]]; then
+        swapoff /swapfile
+        rm -f /swapfile
+        sed -i '/swapfile/d' /etc/fstab
+    fi
+    
     # Удаление логов
     rm -f /var/log/lemp_automate.log
     
@@ -964,15 +1709,48 @@ uninstall_stack() {
 # Интерактивные функции
 #=====================================================================
 
+prompt_operation() {
+    # Проверяем, установлен ли уже стек
+    if detect_installed_software; then
+        echo -e "${CYAN}=== Выбор операции ===${NC}"
+        echo "1) Добавить новый сайт"
+        echo "2) Установить новый LEMP/LAMP стек (удалит существующий)"
+        read -p "Выберите операцию [1-2] (по умолчанию: 1): " choice
+        
+        case $choice in
+            2)
+                if prompt_yes_no "Это действие удалит существующий стек! Вы уверены?" "n"; then
+                    OPERATION="install"
+                    log_info "Выбрано: Установка нового стека"
+                else
+                    OPERATION="add_site"
+                    log_info "Выбрано: Добавление нового сайта"
+                fi
+                ;;
+            *)
+                OPERATION="add_site"
+                log_info "Выбрано: Добавление нового сайта"
+                ;;
+        esac
+    else
+        OPERATION="install"
+        log_info "Стек не установлен. Будет выполнена установка."
+    fi
+}
+
 prompt_web_server() {
     echo -e "${CYAN}=== Выбор веб-сервера ===${NC}"
     echo "1) Nginx (рекомендуется)"
     echo "2) Apache"
-    read -p "Выберите веб-сервер [1-2] (по умолчанию: 1): " choice
+    echo "3) Nginx + Apache (Nginx в качестве прокси)"
+    read -p "Выберите веб-сервер [1-3] (по умолчанию: 1): " choice
     
     case $choice in
         2)
             WEB_SERVER="apache"
+            ;;
+        3)
+            WEB_SERVER="nginx_apache_proxy"
             ;;
         *)
             WEB_SERVER="nginx"
@@ -980,6 +1758,28 @@ prompt_web_server() {
     esac
     
     log_info "Выбран веб-сервер: ${WEB_SERVER}"
+    
+    # Выбор обработчика PHP, если выбран Apache
+    if [[ "$WEB_SERVER" == "apache" ]]; then
+        echo -e "${CYAN}=== Выбор обработчика PHP ===${NC}"
+        echo "1) PHP-FPM (рекомендуется)"
+        echo "2) mod_php (Apache модуль)"
+        read -p "Выберите обработчик PHP [1-2] (по умолчанию: 1): " choice
+        
+        case $choice in
+            2)
+                PHP_HANDLER="mod_php"
+                ;;
+            *)
+                PHP_HANDLER="fpm"
+                ;;
+        esac
+        
+        log_info "Выбран обработчик PHP: ${PHP_HANDLER}"
+    else
+        # Для Nginx всегда используем PHP-FPM
+        PHP_HANDLER="fpm"
+    fi
 }
 
 prompt_php_version() {
@@ -1157,17 +1957,24 @@ display_banner() {
     echo " | |___| |____| |  | | |      ____) | || (_| | (__|   <   "
     echo " |_____|______|_|  |_|_|     |_____/ \__\__,_|\___|_|\_\  "
     echo -e "${NC}"
-    echo "  Автоматическое развертывание LEMP/LAMP стека"
-    echo "  Версия: 1.0.0"
+    echo "  Автоматическое развертывание LEMP/LAMP стека Pro"
+    echo "  Версия: 2.0.0"
     echo "  ------------------------------------------------"
     echo ""
 }
 
 display_summary() {
     echo -e "${CYAN}=== Сводка настроек ===${NC}"
-    echo "Веб-сервер:        ${WEB_SERVER}"
-    echo "Версия PHP:        ${PHP_VERSION}"
-    echo "СУБД:              ${DATABASE} ${DB_VERSION}"
+    
+    if [[ "$OPERATION" == "add_site" ]]; then
+        echo "Операция:          Добавление сайта"
+    else
+        echo "Операция:          Установка стека"
+        echo "Веб-сервер:        ${WEB_SERVER}"
+        echo "Версия PHP:        ${PHP_VERSION}"
+        echo "СУБД:              ${DATABASE} ${DB_VERSION}"
+    fi
+    
     echo "Домен:             ${DOMAIN}"
     echo "Директория сайта:  ${SITE_DIR}"
     
@@ -1177,11 +1984,17 @@ display_summary() {
         echo "Пароль БД:         ${DB_PASS}"
     fi
     
-    echo "Настроить SSL:     $(if [[ "$ENABLE_SSL" == true ]]; then echo "Да"; else echo "Нет"; fi)"
-    echo "Настроить swap:    $(if [[ "$ENABLE_SWAP" == true ]]; then echo "Да (${SWAP_SIZE})"; else echo "Нет"; fi)"
+    if [[ "$OPERATION" == "install" ]]; then
+        echo "Настроить SSL:     $(if [[ "$ENABLE_SSL" == true ]]; then echo "Да"; else echo "Нет"; fi)"
+        echo "Настроить swap:    $(if [[ "$ENABLE_SWAP" == true ]]; then echo "Да (${SWAP_SIZE})"; else echo "Нет"; fi)"
+    else
+        if [[ "$ENABLE_SSL" == true ]]; then
+            echo "Настроить SSL:     Да"
+        fi
+    fi
     echo ""
     
-    if prompt_yes_no "Продолжить установку с этими настройками?" "y"; then
+    if prompt_yes_no "Продолжить с этими настройками?" "y"; then
         return 0
     else
         log_error "Установка отменена пользователем"
@@ -1189,30 +2002,8 @@ display_summary() {
     fi
 }
 
-main() {
-    # Проверка прав root
-    check_root
-    
-    # Создание лог-файла
-    touch "${LOG_FILE}"
-    
-    # Отображение баннера
-    display_banner
-    
-    # Определение ОС
-    detect_os
-    
-    # Интерактивный ввод настроек
-    prompt_web_server
-    prompt_php_version
-    prompt_database
-    prompt_domain
-    prompt_db_credentials
-    prompt_ssl
-    prompt_swap
-    
-    # Отображение и подтверждение настроек
-    display_summary
+install_stack() {
+    log_info "Установка LEMP/LAMP стека..."
     
     # Обновление системы
     update_system
@@ -1221,10 +2012,17 @@ main() {
     install_dependencies
     
     # Установка веб-сервера
-    if [[ "$WEB_SERVER" == "nginx" ]]; then
+    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
         install_nginx
-    else
+    fi
+    
+    if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
         install_apache
+    fi
+    
+    # Если выбран режим прокси, настраиваем его
+    if [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        configure_nginx_apache_proxy
     fi
     
     # Установка PHP
@@ -1240,12 +2038,8 @@ main() {
     # Настройка базы данных
     configure_database
     
-    # Настройка веб-сервера
-    if [[ "$WEB_SERVER" == "nginx" ]]; then
-        configure_nginx
-    else
-        configure_apache
-    fi
+    # Добавление сайта
+    add_site
     
     # Оптимизация PHP
     configure_php
@@ -1272,17 +2066,95 @@ main() {
         setup_swap
     fi
     
+    # Дополнительные меры безопасности
+    enhance_security
+    
     # Очистка системы
     cleanup_system
     
     log_success "=================================================="
     log_success "      Установка LEMP/LAMP стека завершена!        "
     log_success "=================================================="
+}
+
+add_site() {
+    log_info "Добавление нового сайта: ${DOMAIN}..."
     
-    echo -e "${GREEN}Установка завершена!${NC}"
-    echo "Веб-сервер:        ${WEB_SERVER}"
-    echo "Версия PHP:        ${PHP_VERSION}"
-    echo "СУБД:              ${DATABASE} ${DB_VERSION}"
+    # Настройка веб-сервера для сайта
+    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        configure_nginx
+    fi
+    
+    if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        configure_apache
+    fi
+    
+    # Создание базы данных и пользователя, если запрошено
+    if [[ "$CREATE_DB" == true ]]; then
+        configure_database
+    fi
+    
+    # Настройка SSL, если запрошено
+    if [[ "$ENABLE_SSL" == true ]]; then
+        setup_ssl
+    fi
+    
+    log_success "Сайт ${DOMAIN} успешно добавлен"
+}
+
+main() {
+    # Проверка прав root
+    check_root
+    
+    # Создание лог-файла
+    touch "${LOG_FILE}"
+    
+    # Отображение баннера
+    display_banner
+    
+    # Определение ОС
+    detect_os
+    
+    # Проверка установленного ПО
+    prompt_operation
+    
+    # Ветвление логики в зависимости от выбранной операции
+    if [[ "$OPERATION" == "add_site" ]]; then
+        # Запрос только необходимых параметров для добавления сайта
+        prompt_domain
+        prompt_db_credentials
+        prompt_ssl
+        
+        # Отображение и подтверждение настроек
+        display_summary
+        
+        # Добавление сайта
+        add_site
+    else
+        # Запрос параметров для полной установки
+        prompt_web_server
+        prompt_php_version
+        prompt_database
+        prompt_domain
+        prompt_db_credentials
+        prompt_ssl
+        prompt_swap
+        
+        # Отображение и подтверждение настроек
+        display_summary
+        
+        # Установка стека
+        install_stack
+    fi
+    
+    echo -e "${GREEN}Операция завершена!${NC}"
+    
+    if [[ "$OPERATION" == "install" ]]; then
+        echo "Веб-сервер:        ${WEB_SERVER}"
+        echo "Версия PHP:        ${PHP_VERSION}"
+        echo "СУБД:              ${DATABASE} ${DB_VERSION}"
+    fi
+    
     echo "Домен:             ${DOMAIN}"
     echo "Директория сайта:  ${SITE_DIR}"
     
@@ -1295,7 +2167,7 @@ main() {
     fi
     
     echo ""
-    echo "Вы можете просмотреть лог установки: ${LOG_FILE}"
+    echo "Вы можете просмотреть лог операции: ${LOG_FILE}"
     echo ""
     
     if [[ "$DOMAIN" != "localhost" ]]; then
@@ -1308,7 +2180,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${GREEN}Спасибо за использование скрипта LEMP/LAMP Stack Automate!${NC}"
+    echo -e "${GREEN}Спасибо за использование LEMP/LAMP Stack Automate Pro!${NC}"
 }
 
 #=====================================================================
