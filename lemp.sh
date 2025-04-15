@@ -1,10 +1,9 @@
 #!/bin/bash
 #=====================================================================
-# LEMP/LAMP Stack Automate Pro
+# LEMP/LAMP Stack 
 #=====================================================================
-# Автор: Ваше Имя
-# Дата: 14 апреля 2025
-# Версия: 2.0.0
+# Автор: Павлович Владислав - pavlovich.live
+# Версия: 1.1.0
 #
 # Описание: Этот скрипт автоматизирует развертывание и настройку
 # LEMP или LAMP стека с оптимизацией производительности и функциями
@@ -344,19 +343,56 @@ install_nginx() {
 install_apache() {
     log_info "Установка Apache..."
     
+    # Подготавливаем конфигурацию перед установкой пакетов
+    if [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        # Создаем директории, если их ещё нет
+        mkdir -p /etc/apache2/
+        
+        # Создаем ports.conf до установки пакета
+        echo "Listen 127.0.0.1:8080" > /etc/apache2/ports.conf.new
+    fi
+    
+    # Устанавливаем Apache
     if [[ "$OS_TYPE" == "debian" ]]; then
         apt install -y apache2
     elif [[ "$OS_TYPE" == "rhel" ]]; then
         yum install -y httpd
     fi
     
-    # Запуск и включение Apache
-    if [[ "$OS_TYPE" == "debian" ]]; then
-        $SERVICE_MANAGER start apache2
-        $SERVICE_MANAGER enable apache2
-    elif [[ "$OS_TYPE" == "rhel" ]]; then
-        $SERVICE_MANAGER start httpd
-        $SERVICE_MANAGER enable httpd
+    # Настройка для режима прокси - сразу после установки
+    if [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            # Применяем изменения порта
+            if [[ -f /etc/apache2/ports.conf.new ]]; then
+                mv /etc/apache2/ports.conf.new /etc/apache2/ports.conf
+            else
+                # Если файл не создался заранее, редактируем существующий
+                sed -i 's/Listen 80/Listen 127.0.0.1:8080/g' /etc/apache2/ports.conf
+            fi
+            
+            # Перенастраиваем виртуальные хосты
+            sed -i 's/VirtualHost \*:80/VirtualHost 127.0.0.1:8080/g' /etc/apache2/sites-available/000-default.conf
+            
+            # Перезапуск Apache с новыми настройками
+            $SERVICE_MANAGER restart apache2
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            # Перенастраиваем Apache на порт 8080
+            sed -i 's/Listen 80/Listen 127.0.0.1:8080/g' /etc/httpd/conf/httpd.conf
+            
+            # Перезапуск Apache с новыми настройками
+            $SERVICE_MANAGER restart httpd
+        fi
+    fi
+    
+    # Запуск и включение Apache (если не в режиме прокси)
+    if [[ "$WEB_SERVER" != "nginx_apache_proxy" ]]; then
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            $SERVICE_MANAGER restart apache2
+            $SERVICE_MANAGER enable apache2
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            $SERVICE_MANAGER restart httpd
+            $SERVICE_MANAGER enable httpd
+        fi
     fi
     
     log_success "Apache успешно установлен и запущен"
@@ -1378,10 +1414,6 @@ enhance_security() {
         # Создание резервной копии
         cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
         
-        # Отключение SSH-доступа для root
-        sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin no/g' /etc/ssh/sshd_config
-        sed -i 's/^PermitRootLogin yes/PermitRootLogin no/g' /etc/ssh/sshd_config
-        
         # Отключение аутентификации по паролю, если есть ключи
         if [[ -d /root/.ssh ]] || compgen -G "/home/*/.ssh" > /dev/null; then
             if prompt_yes_no "Обнаружены SSH-ключи. Отключить аутентификацию по паролю (повышает безопасность, но доступ будет только по ключу)?" "n"; then
@@ -1535,9 +1567,15 @@ EOF
 
 # Дополнительная настройка защиты от DDoS для Nginx
 setup_nginx_dos_protection() {
+
+    if [[ -f /etc/nginx/conf.d/rate-limiting.conf ]]; then
+        log_info "Защита от DoS уже настроена. Пропускаем этот шаг."
+        return
+    fi
+
     log_info "Настройка защиты от DoS-атак для Nginx..."
     
-    # Создание файла конфигурации ограничений
+    # Создание файла конфигурации ограничений на уровне http
     cat > /etc/nginx/conf.d/rate-limiting.conf << EOF
 # Ограничение количества запросов
 limit_req_zone \$binary_remote_addr zone=one:10m rate=1r/s;
@@ -1545,6 +1583,12 @@ limit_req_zone \$binary_remote_addr zone=two:10m rate=10r/s;
 
 # Ограничение количества соединений
 limit_conn_zone \$binary_remote_addr zone=addr:10m;
+
+# Защита от медленных запросов (Slowloris) - на уровне http
+client_body_timeout 10s;
+client_header_timeout 10s;
+keepalive_timeout 65s;
+send_timeout 10s;
 
 # Настройки по умолчанию для всех серверов
 server {
@@ -1554,15 +1598,6 @@ server {
     # Ограничение размера тела запроса
     client_max_body_size 10m;
     
-    # Ограничение времени чтения тела запроса
-    client_body_timeout 10s;
-    
-    # Ограничение времени чтения заголовков запроса
-    client_header_timeout 10s;
-    
-    # Ограничение времени отправки ответа клиенту
-    send_timeout 10s;
-    
     # Ограничение количества соединений с одного IP
     limit_conn addr 15;
     
@@ -1571,7 +1606,7 @@ server {
 }
 EOF
     
-    # Добавление настроек в шаблон конфигурации виртуального хоста
+    # Отдельный файл для включения в блоки location
     cat > /etc/nginx/snippets/rate-limiting.conf << EOF
 # Ограничение количества запросов к PHP файлам
 location ~ \.php$ {
@@ -1595,27 +1630,34 @@ location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg)$ {
     add_header Cache-Control "public, no-transform";
 }
 
-# Защита от медленных запросов (Slowloris)
-client_body_timeout 10s;
-client_header_timeout 10s;
-keepalive_timeout 65s;
-send_timeout 10s;
-
 # Ограничение количества соединений с одного IP
 limit_conn addr 20;
 limit_conn_status 429;
 EOF
     
-    # Добавление ссылки на конфигурацию в виртуальные хосты
+    # Создаем файл с настройками для включения в server блоки
+    cat > /etc/nginx/conf.d/server-rate-limiting.conf << EOF
+# Включите эти настройки в server блоки
+# Защита от медленных запросов (Slowloris) - на уровне server
+client_body_timeout 10s;
+client_header_timeout 10s;
+keepalive_timeout 65s;
+send_timeout 10s;
+EOF
+    
+    # Переделываем логику включения сниппета - только для блоков server
     for config in /etc/nginx/sites-available/*.conf; do
-        if [[ -f "$config" ]] && ! grep -q "include snippets/rate-limiting.conf;" "$config"; then
-            # Вставляем включение сниппета перед первым закрывающим "}"
-            sed -i '/}/i \    # Включение защиты от DDoS\n    include snippets/rate-limiting.conf;' "$config"
+        if [[ -f "$config" ]]; then
+            if ! grep -q "include snippets/server-rate-limiting.conf;" "$config"; then
+                sed -i '/server {/a \    # Включение защиты от DDoS на уровне сервера\n    include snippets/server-rate-limiting.conf;' "$config"
+            fi
         fi
     done
+
+
     
     # Перезагрузка Nginx для применения изменений
-    $SERVICE_MANAGER reload nginx
+    nginx -t && $SERVICE_MANAGER reload nginx
     
     log_success "Защита от DoS-атак для Nginx настроена"
 }
@@ -1626,7 +1668,7 @@ EOF
 
 cleanup_system() {
     log_info "Очистка системы..."
-    
+
     if [[ "$OS_TYPE" == "debian" ]]; then
         apt clean
         apt autoremove -y
@@ -2011,18 +2053,23 @@ install_stack() {
     # Установка зависимостей
     install_dependencies
     
-    # Установка веб-сервера
-    if [[ "$WEB_SERVER" == "nginx" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
-        install_nginx
-    fi
-    
-    if [[ "$WEB_SERVER" == "apache" || "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
-        install_apache
-    fi
-    
-    # Если выбран режим прокси, настраиваем его
+    # Порядок установки зависит от выбранного стека
     if [[ "$WEB_SERVER" == "nginx_apache_proxy" ]]; then
+        # Для режима прокси сначала устанавливаем Apache с настройкой порта 8080
+        install_apache
+        
+        # Затем устанавливаем Nginx
+        install_nginx
+        
+        # Настраиваем проксирование
         configure_nginx_apache_proxy
+    else
+        # Обычный порядок для стандартных стеков
+        if [[ "$WEB_SERVER" == "nginx" ]]; then
+            install_nginx
+        elif [[ "$WEB_SERVER" == "apache" ]]; then
+            install_apache
+        fi
     fi
     
     # Установка PHP
@@ -2180,7 +2227,7 @@ main() {
     fi
     
     echo ""
-    echo -e "${GREEN}Спасибо за использование LEMP/LAMP Stack Automate Pro!${NC}"
+    echo -e "${GREEN}Спасибо за использование LEMP/LAMP Stack!${NC}"
 }
 
 #=====================================================================
