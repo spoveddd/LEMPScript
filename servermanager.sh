@@ -3,7 +3,7 @@
 # LEMP/LAMP Stack 
 #=====================================================================
 # Автор: Павлович Владислав - pavlovich.live
-# Версия: 1.1.0
+# Версия: 2.3.4
 #
 # Описание: Этот скрипт автоматизирует развертывание и настройку
 # LEMP или LAMP стека с оптимизацией производительности и функциями
@@ -11,6 +11,7 @@
 # Позволяет выбрать между различными конфигурациями, включая
 # Nginx+Apache в режиме прокси, и добавление новых сайтов в
 # существующую конфигурацию.
+# Кроме того добавлена поддержка установки панелей управления 
 #=====================================================================
 
 # Строгий режим выполнения
@@ -47,6 +48,8 @@ OS_TYPE=""
 PACKAGE_MANAGER=""
 SERVICE_MANAGER=""
 PHP_HANDLER="fpm" # fpm, fcgi или proxy
+PANEL_TYPE=""
+
 
 #=====================================================================
 # Служебные функции
@@ -274,6 +277,41 @@ check_installed_database() {
     fi
 }
 
+detect_installed_panel() {
+    log_info "Проверка установленных панелей управления..."
+    
+    # Проверка ISPManager
+    if [ -d "/usr/local/mgr5" ] || [ -d "/usr/local/ispmgr" ] || [ -f "/usr/bin/ispmgr" ]; then
+        log_info "Обнаружена панель управления: ISPManager"
+        PANEL_TYPE="ispmanager"
+        return 0
+    fi
+    
+    # Проверка Hestia Control Panel
+    if [ -d "/usr/local/hestia" ] || [ -d "/etc/hestiacp" ]; then
+        log_info "Обнаружена панель управления: Hestia Control Panel"
+        PANEL_TYPE="hestia"
+        return 0
+    fi
+    
+    # Проверка FastPanel
+    if [ -d "/usr/local/fastpanel2" ] || [ -f "/usr/bin/fpctl" ]; then
+        log_info "Обнаружена панель управления: FastPanel"
+        PANEL_TYPE="fastpanel"
+        return 0
+    fi
+    
+    # Проверка aaPanel
+    if [ -d "/www/server/panel" ] || [ -f "/etc/init.d/bt" ]; then
+        log_info "Обнаружена панель управления: aaPanel"
+        PANEL_TYPE="aapanel"
+        return 0
+    fi
+    
+    log_info "Панели управления не обнаружены"
+    return 1
+}
+
 detect_installed_software() {
     log_info "Проверка установленного программного обеспечения..."
     
@@ -301,15 +339,48 @@ detect_installed_software() {
 #=====================================================================
 
 update_system() {
-    log_info "Обновление системных пакетов..."
+    # Запрос пользователя о типе обновления
+    echo -e "${CYAN}=== Обновление системы ===${NC}"
+    echo "1) Только обновить индексы пакетов (быстро, рекомендуется)"
+    echo "2) Обновить только необходимые пакеты (средне)"
+    echo "3) Полное обновление всей системы (долго)"
+    echo "4) Пропустить обновление (не рекомендуется)"
+    read -p "Выберите вариант обновления [1-4] (по умолчанию: 1): " choice
     
-    if [[ "$OS_TYPE" == "debian" ]]; then
-        apt update && apt upgrade -y
-    elif [[ "$OS_TYPE" == "rhel" ]]; then
-        yum update -y
-    fi
+    case $choice in
+        2)
+            log_info "Обновление только необходимых пакетов..."
+            if [[ "$OS_TYPE" == "debian" ]]; then
+                apt update
+                apt install -y --only-upgrade curl wget gnupg2 ca-certificates lsb-release software-properties-common apt-transport-https
+            elif [[ "$OS_TYPE" == "rhel" ]]; then
+                yum update -y curl wget gnupg2 ca-certificates epel-release
+            fi
+            ;;
+        3)
+            log_info "Полное обновление системных пакетов..."
+            if [[ "$OS_TYPE" == "debian" ]]; then
+                apt update && apt upgrade -y
+            elif [[ "$OS_TYPE" == "rhel" ]]; then
+                yum update -y
+            fi
+            ;;
+        4)
+            log_info "Обновление системы пропущено по запросу пользователя"
+            return
+            ;;
+        *)
+            # Вариант по умолчанию - только обновление индексов
+            log_info "Обновление индексов пакетов..."
+            if [[ "$OS_TYPE" == "debian" ]]; then
+                apt update
+            elif [[ "$OS_TYPE" == "rhel" ]]; then
+                yum check-update
+            fi
+            ;;
+    esac
     
-    log_success "Система успешно обновлена"
+    log_success "Обновление системы завершено"
 }
 
 install_dependencies() {
@@ -1236,6 +1307,697 @@ EOF
 }
 
 #=====================================================================
+# Функции для управления панелями
+#=====================================================================
+
+prompt_main_selection() {
+    echo -e "${CYAN}=== Выбор типа установки ===${NC}"
+    echo "1) Установить LEMP/LAMP стек"
+    echo "2) Установить панель управления сервером"
+    read -p "Выберите тип установки [1-2] (по умолчанию: 1): " choice
+    
+    case $choice in
+        2)
+            OPERATION="install_panel"
+            log_info "Выбрано: Установка панели управления"
+            ;;
+        *)
+            OPERATION="install_stack"
+            log_info "Выбрано: Установка LEMP/LAMP стека"
+            ;;
+    esac
+}
+
+prompt_panel_selection() {
+    echo -e "${CYAN}=== Выбор панели управления ===${NC}"
+    echo "1) ISPManager"
+    echo "2) Hestia Control Panel"
+    echo "3) FastPanel"
+    echo "4) aaPanel"
+    read -p "Выберите панель управления [1-4] (по умолчанию: 1): " choice
+    
+    case $choice in
+        2)
+            PANEL_TYPE="hestia"
+            log_info "Выбрана панель: Hestia Control Panel"
+            ;;
+        3)
+            PANEL_TYPE="fastpanel"
+            log_info "Выбрана панель: FastPanel"
+            ;;
+        4)
+            PANEL_TYPE="aapanel"
+            log_info "Выбрана панель: aaPanel"
+            ;;
+        *)
+            PANEL_TYPE="ispmanager"
+            log_info "Выбрана панель: ISPManager"
+            ;;
+    esac
+}
+
+install_panel() {
+    log_info "Установка панели управления ${PANEL_TYPE}..."
+    
+    case $PANEL_TYPE in
+        "ispmanager")
+            install_ispmanager
+            ;;
+        "hestia")
+            install_hestia
+            ;;
+        "fastpanel")
+            install_fastpanel
+            ;;
+        "aapanel")
+            install_aapanel
+            ;;
+    esac
+    
+    log_success "Панель управления ${PANEL_TYPE} успешно установлена"
+}
+
+install_ispmanager() {
+    log_info "Установка ISPManager..."
+    
+    # Обновление системы
+    update_system
+    
+    # Установка зависимостей
+    install_dependencies
+    
+    # Удаление старых версий файла установщика, если они существуют
+    rm -f install.sh install.sh.* 2>/dev/null || true
+    
+    # Скачивание установщика ISPManager
+    if ! wget -O install.sh https://download.ispmanager.com/install.sh; then
+        log_error "Не удалось скачать установщик ISPManager. Проверьте соединение с интернетом."
+        return 1
+    fi
+    
+    # Проверка, что файл успешно загружен и имеет минимальный размер
+    if [ ! -s install.sh ] || [ $(stat -c%s install.sh) -lt 1000 ]; then
+        log_error "Скачанный файл установщика ISPManager слишком мал или пуст."
+        rm -f install.sh
+        return 1
+    fi
+    
+    # Установка прав на выполнение
+    chmod +x install.sh
+    
+    # Запрос лицензионного ключа
+    read -p "Введите лицензионный ключ для ISPManager (оставьте пустым для триальной версии): " license_key
+    
+    # Запуск установки в интерактивном режиме
+    log_info "Запуск установщика ISPManager в интерактивном режиме..."
+    
+    if [[ -n "$license_key" ]]; then
+        # Запуск с ключом
+        ./install.sh --key "$license_key"
+    else
+        # Запуск без ключа (триальная версия)
+        ./install.sh
+    fi
+    
+    # Проверка результата установки
+    if [ -d "/usr/local/mgr5" ] || grep -q "Your newly installed ispmanager panel" "$INSTALL_LOG"; then
+        log_success "ISPManager успешно установлен"
+        
+        # Вывод информации о доступе
+        echo -e "${GREEN}=================================================${NC}"
+        echo -e "${GREEN}ISPManager успешно установлен!${NC}"
+        echo -e "${GREEN}=================================================${NC}"
+        echo "Доступ к панели управления: https://$(hostname -f):1500/"
+        echo "Логин: admin"
+        echo "Пароль: admin (если не было указано иное в процессе установки)"
+        echo "Рекомендуется изменить пароль после первого входа!"
+        echo -e "${GREEN}=================================================${NC}"
+        
+        # Очистка
+        rm -f install.sh
+        
+        return 0
+    else
+        log_error "Установка ISPManager не удалась. Файлы установки не обнаружены."
+        rm -f install.sh
+        return 1
+    fi
+}
+
+
+install_hestia() {
+    log_info "Установка Hestia Control Panel..."
+    
+    # Обновление системы
+    update_system
+    
+    # Установка зависимостей
+    install_dependencies
+    
+    # Скачивание и запуск установщика Hestia
+    wget https://raw.githubusercontent.com/hestiacp/hestiacp/release/install/hst-install.sh
+    chmod +x hst-install.sh
+    
+    # Запрос параметров установки
+    read -p "Введите email администратора: " admin_email
+    if [[ -z "$admin_email" ]]; then
+        admin_email="admin@$(hostname -f)"
+    fi
+    
+    # Запуск установки в автоматическом режиме
+    ./hst-install.sh --email "$admin_email" --password $(openssl rand -base64 8) --multiphp yes
+    
+    # Очистка
+    rm -f hst-install.sh
+    
+    log_success "Hestia Control Panel успешно установлен"
+    
+    # Вывод информации о доступе
+    echo -e "${GREEN}=================================================${NC}"
+    echo -e "${GREEN}Hestia Control Panel успешно установлен!${NC}"
+    echo -e "${GREEN}=================================================${NC}"
+    echo "Доступ к панели управления: https://$(hostname -f):8083/"
+    echo "Логин: admin"
+    echo "Пароль: Был сгенерирован во время установки, проверьте вывод выше."
+    echo -e "${GREEN}=================================================${NC}"
+}
+
+install_fastpanel() {
+    log_info "Установка FastPanel..."
+    
+    # Проверка наличия MySQL/MariaDB
+    if check_installed_database || check_installed_webserver || check_installed_php; then
+        log_warning "На сервере обнаружены установленные компоненты. FastPanel требует чистую установку ОС."
+        
+        # Предлагаем удалить все компоненты
+        if prompt_yes_no "Хотите автоматически удалить все компоненты перед установкой FastPanel? (рекомендуется)" "y"; then
+            log_info "Удаление всех компонентов перед установкой FastPanel..."
+            
+            # Принудительное удаление проблемного пакета exim4
+            if [[ "$OS_TYPE" == "debian" ]]; then
+                # Сначала принудительно удаляем exim4
+                dpkg --purge --force-all exim4-daemon-light exim4-config exim4-base exim4 2>/dev/null
+            fi
+            
+            # Останавливаем сервисы
+            $SERVICE_MANAGER stop mysql mariadb nginx apache2 httpd php*-fpm php-fpm 2>/dev/null
+            
+            # Удаление компонентов в зависимости от типа ОС
+            if [[ "$OS_TYPE" == "debian" ]]; then
+                # Удаление репозиториев
+                rm -f /etc/apt/sources.list.d/mariadb* /etc/apt/sources.list.d/mysql* /etc/apt/sources.list.d/nginx* /etc/apt/sources.list.d/php* 2>/dev/null
+                
+                # Принудительное удаление пакетов
+                apt-get purge -y --force-yes mysql* mariadb* nginx* apache2* php* exim4* 2>/dev/null
+                apt-get autoremove -y --force-yes 2>/dev/null
+                apt-get clean 2>/dev/null
+                
+                # Исправление возможных проблем с dpkg
+                dpkg --configure -a 2>/dev/null
+                
+                # Удаление конфигурационных директорий
+                rm -rf /etc/mysql /var/lib/mysql /etc/mariadb /var/lib/mariadb
+                rm -rf /etc/nginx /etc/apache2
+                rm -rf /etc/php*
+                
+                # Удаление логов
+                rm -rf /var/log/mysql* /var/log/mariadb* /var/log/nginx* /var/log/apache2* /var/log/php*
+                
+            elif [[ "$OS_TYPE" == "rhel" ]]; then
+                # Удаление репозиториев
+                rm -f /etc/yum.repos.d/mariadb* /etc/yum.repos.d/mysql* /etc/yum.repos.d/nginx* 2>/dev/null
+                
+                # Удаление пакетов
+                yum remove -y mysql* mariadb* nginx* httpd* php* 2>/dev/null
+                yum autoremove -y 2>/dev/null
+                yum clean all 2>/dev/null
+                
+                # Удаление конфигурационных директорий
+                rm -rf /etc/my.cnf* /var/lib/mysql
+                rm -rf /etc/nginx /etc/httpd
+                rm -rf /etc/php*
+                
+                # Удаление логов
+                rm -rf /var/log/mysql* /var/log/mariadb* /var/log/nginx* /var/log/httpd* /var/log/php*
+            fi
+            
+            log_success "Компоненты, мешающие установке FastPanel, успешно удалены"
+        else
+            log_warning "Установка FastPanel на систему с предустановленными компонентами может не сработать"
+            if ! prompt_yes_no "Всё равно продолжить установку?" "n"; then
+                log_error "Установка FastPanel отменена пользователем"
+                return 1
+            fi
+        fi
+    fi
+    
+    # Обновление системы
+    update_system
+    
+    # Установка зависимостей
+    install_dependencies
+    
+    # Скачивание и запуск установщика FastPanel
+    wget http://repo.fastpanel.direct/install_fastpanel.sh
+    chmod +x install_fastpanel.sh
+    
+    # Запуск установки
+    ./install_fastpanel.sh
+    INSTALLER_EXIT_CODE=$?
+    
+    # Проверка успешности установки
+    INSTALL_SUCCESS=false
+    if [[ $INSTALLER_EXIT_CODE -eq 0 ]] || [ -d "/usr/local/fastpanel" ] || [ -d "/usr/local/fastpanel2" ] || 
+       [ -d "/usr/local/fastpanel2-nginx" ] || [ -f "/usr/bin/fpctl" ] || 
+       grep -q "FASTPANEL successfully installed" "${LOG_FILE}"; then
+        INSTALL_SUCCESS=true
+    fi
+    
+    # Дополнительная проверка, если не нашли путь установки
+    if [[ "$INSTALL_SUCCESS" == false ]]; then
+        log_info "Поиск установленных компонентов FastPanel..."
+        FOUND_FILES=$(find /usr/local -name "*fastpanel*" -type d 2>/dev/null | wc -l)
+        if [[ $FOUND_FILES -gt 0 ]]; then
+            log_info "Обнаружены файлы FastPanel в нестандартных путях"
+            INSTALL_SUCCESS=true
+        fi
+    fi
+    
+    # Очистка
+    rm -f install_fastpanel.sh
+    
+    if $INSTALL_SUCCESS; then
+        log_success "FastPanel успешно установлен"
+        
+        # Вывод информации о доступе
+        echo -e "${GREEN}=================================================${NC}"
+        echo -e "${GREEN}FastPanel успешно установлен!${NC}"
+        echo -e "${GREEN}=================================================${NC}"
+        echo "Доступ к панели управления: https://$(hostname -f):8888/"
+        echo "Логин и пароль были указаны во время установки."
+        echo "Проверьте вывод установщика для получения данных для входа."
+        echo -e "${GREEN}=================================================${NC}"
+        return 0
+    else
+        log_error "Установка FastPanel не удалась. Проверьте лог для получения дополнительной информации."
+        echo -e "${RED}=================================================${NC}"
+        echo -e "${RED}Установка FastPanel не удалась!${NC}"
+        echo -e "${RED}=================================================${NC}"
+        echo "Возможные причины:"
+        echo "1. Не все конфликтующие компоненты были удалены"
+        echo "2. Проблемы с сетевым подключением к репозиторию FastPanel"
+        echo "3. Несовместимость с текущей версией операционной системы"
+        echo ""
+        echo "Рекомендация: Для установки FastPanel лучше использовать чистую"
+        echo "установку операционной системы без предустановленных компонентов."
+        echo -e "${RED}=================================================${NC}"
+        return 1
+    fi
+}
+
+install_aapanel() {
+    log_info "Установка aaPanel..."
+    
+    # Обновление системы
+    update_system
+    
+    # Установка зависимостей
+    install_dependencies
+    
+    # Скачивание и запуск установщика aaPanel
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        wget -O install.sh http://www.aapanel.com/script/install-ubuntu_6.0_en.sh
+    elif [[ "$OS_TYPE" == "rhel" ]]; then
+        wget -O install.sh http://www.aapanel.com/script/install_6.0_en.sh
+    fi
+    
+    chmod +x install.sh
+    
+    # Запуск установки
+    ./install.sh
+    
+    # Очистка
+    rm -f install.sh
+    
+    log_success "aaPanel успешно установлен"
+    
+    # Вывод информации о доступе
+    echo -e "${GREEN}=================================================${NC}"
+    echo -e "${GREEN}aaPanel успешно установлен!${NC}"
+    echo -e "${GREEN}=================================================${NC}"
+    echo "Доступ к панели управления: http://$(hostname -f):8888/"
+    echo "Логин и пароль были указаны во время установки."
+    echo -e "${GREEN}=================================================${NC}"
+}
+
+
+uninstall_panel() {
+    log_info "Удаление установленной панели управления: ${PANEL_TYPE}..."
+    
+    # Предварительный запрос на удаление всех компонентов
+    if prompt_yes_no "Рекомендуется удалить все компоненты стека (веб-серверы, базы данных, PHP) для установки новой панели. Выполнить полную очистку?" "y"; then
+        FULL_CLEANUP=true
+    else
+        FULL_CLEANUP=false
+        log_warning "Выбрано удаление только панели управления без компонентов стека. Могут возникнуть конфликты при установке новой панели."
+    fi
+    
+    # Удаление панели в зависимости от типа
+    case $PANEL_TYPE in
+        "ispmanager")
+            log_info "Удаление ISPManager..."
+            
+            # Проверка наличия скрипта деинсталляции
+            if [ -f "/usr/local/ispmgr/sbin/uninstall.sh" ]; then
+                if prompt_yes_no "Запустить официальный скрипт удаления ISPManager?" "y"; then
+                    /usr/local/ispmgr/sbin/uninstall.sh
+                else
+                    # Ручное удаление компонентов ISPManager
+                    service ispmgr stop 2>/dev/null || systemctl stop ispmgr 2>/dev/null
+                    
+                    # Удаление пакетов
+                    if [[ "$OS_TYPE" == "debian" ]]; then
+                        apt purge -y ispmgr* 2>/dev/null
+                    elif [[ "$OS_TYPE" == "rhel" ]]; then
+                        yum remove -y ispmgr* 2>/dev/null
+                    fi
+                    
+                    # Удаление директорий
+                    rm -rf /usr/local/ispmgr 2>/dev/null
+                    rm -rf /usr/local/mgr5 2>/dev/null
+                    rm -rf /opt/ispmgr 2>/dev/null
+                fi
+            else
+                log_warning "Не найден официальный скрипт удаления ISPManager. Выполняем ручное удаление..."
+                
+                # Останавливаем службы
+                service ispmgr stop 2>/dev/null || systemctl stop ispmgr 2>/dev/null
+                
+                # Удаление пакетов
+                if [[ "$OS_TYPE" == "debian" ]]; then
+                    apt purge -y ispmgr* 2>/dev/null
+                elif [[ "$OS_TYPE" == "rhel" ]]; then
+                    yum remove -y ispmgr* 2>/dev/null
+                fi
+                
+                # Удаление директорий
+                rm -rf /usr/local/ispmgr 2>/dev/null
+                rm -rf /usr/local/mgr5 2>/dev/null
+                rm -rf /opt/ispmgr 2>/dev/null
+            fi
+            ;;
+            
+        "hestia")
+            log_info "Удаление Hestia Control Panel..."
+            
+            # Попытка удаления с помощью встроенных утилит
+            if [ -f "/usr/local/hestia/bin/v-delete-user-package" ]; then
+                if prompt_yes_no "Удалить Hestia Control Panel с помощью встроенных утилит?" "y"; then
+                    # Останавливаем сервисы Hestia
+                    systemctl stop hestia
+                    
+                    # Удаляем все пакеты, связанные с Hestia
+                    apt purge -y hestia*
+                    apt autoremove -y
+                    
+                    # Удаляем директории Hestia
+                    rm -rf /usr/local/hestia
+                    rm -rf /etc/hestiacp
+                    
+                    log_success "Hestia Control Panel удалена с помощью встроенных утилит"
+                else
+                    log_info "Выполняем ручное удаление Hestia..."
+                    
+                    # Ручное удаление компонентов
+                    systemctl stop hestia nginx apache2 php*-fpm mysql
+                    
+                    # Удаление пакетов
+                    apt purge -y hestia* nginx apache2 php* mysql* mariadb*
+                    apt autoremove -y
+                    
+                    # Удаление директорий
+                    rm -rf /usr/local/hestia
+                    rm -rf /etc/hestiacp
+                fi
+            else
+                log_warning "Встроенные утилиты Hestia не найдены. Выполняем ручное удаление..."
+                
+                # Останавливаем сервисы
+                systemctl stop hestia 2>/dev/null
+                
+                # Удаляем пакеты
+                if [[ "$OS_TYPE" == "debian" ]]; then
+                    apt purge -y hestia* 2>/dev/null
+                    apt autoremove -y
+                elif [[ "$OS_TYPE" == "rhel" ]]; then
+                    yum remove -y hestia* 2>/dev/null
+                    yum autoremove -y
+                fi
+                
+                # Удаляем директории
+                rm -rf /usr/local/hestia 2>/dev/null
+                rm -rf /etc/hestiacp 2>/dev/null
+            fi
+            ;;
+            
+        "fastpanel")
+            log_info "Удаление FastPanel..."
+            
+            # Проверка наличия утилиты управления fpctl
+            if [ -f "/usr/bin/fpctl" ]; then
+                if prompt_yes_no "Запустить официальный процесс удаления FastPanel?" "y"; then
+                    log_info "Запуск официальной утилиты удаления..."
+                    /usr/bin/fpctl cleanup
+                    
+                    # Дополнительная очистка после удаления
+                    rm -rf /usr/local/fastpanel* 2>/dev/null
+                    rm -f /usr/bin/fpctl 2>/dev/null
+                else
+                    perform_manual_fastpanel_cleanup
+                fi
+            else
+                log_warning "Не найден официальный инструмент удаления FastPanel. Выполняем ручное удаление..."
+                perform_manual_fastpanel_cleanup
+            fi
+            ;;
+
+            
+        "aapanel")
+            log_info "Удаление aaPanel..."
+            
+            # Проверка наличия скрипта удаления
+            if [ -f "/etc/init.d/bt" ]; then
+                if prompt_yes_no "Запустить официальный скрипт удаления aaPanel?" "y"; then
+                    /etc/init.d/bt stop
+                    /etc/init.d/bt delete
+                else
+                    # Ручное удаление компонентов
+                    log_info "Выполняем ручное удаление aaPanel..."
+                    
+                    # Останавливаем службы
+                    /etc/init.d/bt stop 2>/dev/null
+                    
+                    # Удаление директорий
+                    rm -rf /www/server/panel 2>/dev/null
+                    rm -rf /www/server/phpinfo 2>/dev/null
+                    rm -f /etc/init.d/bt 2>/dev/null
+                    
+                    # Удаление пользователя
+                    userdel -r www 2>/dev/null
+                    
+                    # Удаление cron заданий
+                    crontab -l | grep -v "/www/server/panel" | crontab -
+                fi
+            else
+                log_warning "Не найден официальный скрипт удаления aaPanel. Выполняем ручное удаление..."
+                
+                # Удаление директорий
+                rm -rf /www/server/panel 2>/dev/null
+                rm -rf /www/server/phpinfo 2>/dev/null
+                rm -f /etc/init.d/bt 2>/dev/null
+                
+                # Удаление пользователя
+                userdel -r www 2>/dev/null
+                
+                # Удаление cron заданий
+                crontab -l | grep -v "/www/server/panel" | crontab -
+            fi
+            ;;
+            
+        *)
+            log_error "Неизвестный тип панели управления или панель не обнаружена"
+            return 1
+            ;;
+    esac
+    
+    # Выполняем полную очистку компонентов стека, если выбрано
+    # В блоке полной очистки компонентов стека внутри uninstall_panel()
+if [[ "$FULL_CLEANUP" == true ]]; then
+    log_info "Выполнение полной очистки компонентов стека..."
+    
+    # Останавливаем все сервисы
+    log_info "Останавливаем все сервисы..."
+    $SERVICE_MANAGER stop nginx apache2 httpd php*-fpm php-fpm mysql mariadb exim4 dovecot proftpd 2>/dev/null || true
+    
+    # Удаление репозиториев
+    log_info "Удаление репозиториев..."
+    if [[ "$OS_TYPE" == "debian" ]]; then
+        # Удаление внешних репозиториев
+        rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
+        
+        # Восстановление стандартных репозиториев, если они были изменены
+        if [[ -f /etc/apt/sources.list.bak ]]; then
+            mv /etc/apt/sources.list.bak /etc/apt/sources.list
+        fi
+        
+        # Обновление индекса пакетов
+        apt update
+    elif [[ "$OS_TYPE" == "rhel" ]]; then
+        # Удаление репозиториев
+        rm -f /etc/yum.repos.d/nginx* /etc/yum.repos.d/mysql* /etc/yum.repos.d/mariadb* /etc/yum.repos.d/remi* /etc/yum.repos.d/epel* 2>/dev/null || true
+        
+        # Очистка кэша yum
+        yum clean all
+    fi
+    
+    # Удаление всех компонентов в зависимости от типа ОС
+    log_info "Удаление всех компонентов веб-стека..."
+        if [[ "$OS_TYPE" == "debian" ]]; then
+            # Сначала исправляем любые проблемы с пакетами
+            apt -f install -y || true
+            
+            # Принудительное удаление проблемных пакетов
+            dpkg --force-all --purge exim4 exim4-base exim4-config exim4-daemon-light exim4-daemon-heavy 2>/dev/null || true
+            
+            # Удаление компонентов веб-сервера
+            for pkg in nginx nginx-common nginx-full nginx-light nginx-extras apache2 apache2-bin apache2-data apache2-utils libapache2-mod-* lighttpd; do
+                apt purge -y $pkg 2>/dev/null || dpkg --force-all --purge $pkg 2>/dev/null || true
+            done
+            
+            # Удаление PHP
+            for pkg in php* libapache2-mod-php*; do
+                apt purge -y $pkg 2>/dev/null || dpkg --force-all --purge $pkg 2>/dev/null || true
+            done
+            
+            # Удаление баз данных
+            for pkg in mysql* mariadb*; do
+                apt purge -y $pkg 2>/dev/null || dpkg --force-all --purge $pkg 2>/dev/null || true
+            done
+            
+            # Удаление FTP и почтовых сервисов
+            for pkg in proftpd* dovecot* postfix*; do
+                apt purge -y $pkg 2>/dev/null || dpkg --force-all --purge $pkg 2>/dev/null || true
+            done
+            
+            # Очистка зависимостей
+            apt --fix-broken install -y || true
+            apt autoremove -y --purge || true
+            apt clean || true
+            
+            # Исправление оставшихся проблем
+            dpkg --configure -a || true
+            
+        elif [[ "$OS_TYPE" == "rhel" ]]; then
+            # Удаление веб-серверов
+            yum remove -y nginx* httpd* lighttpd* 2>/dev/null || true
+            
+            # Удаление PHP
+            yum remove -y php* mod_php* 2>/dev/null || true
+            
+            # Удаление баз данных
+            yum remove -y mysql* mariadb* 2>/dev/null || true
+            
+            # Удаление FTP и почтовых сервисов
+            yum remove -y proftpd* dovecot* postfix* 2>/dev/null || true
+            
+            # Очистка зависимостей
+            yum autoremove -y || true
+            yum clean all || true
+        fi
+        
+        # Удаление конфигурационных директорий и файлов
+        log_info "Удаление конфигурационных директорий и файлов..."
+        
+        # Веб-серверы
+        rm -rf /etc/nginx /etc/apache2 /etc/httpd /etc/lighttpd 2>/dev/null || true
+        rm -rf /var/www/* /usr/share/nginx /usr/share/apache2 /var/lib/nginx 2>/dev/null || true
+        
+        # PHP
+        rm -rf /etc/php* /var/lib/php* 2>/dev/null || true
+        
+        # Базы данных
+        rm -rf /etc/mysql /var/lib/mysql /etc/my.cnf* /etc/mariadb /var/lib/mariadb 2>/dev/null || true
+        
+        # Почтовые сервисы
+        rm -rf /etc/exim4 /etc/dovecot /etc/postfix 2>/dev/null || true
+        
+        # FTP
+        rm -rf /etc/proftpd* 2>/dev/null || true
+        
+        # Удаление логов
+        log_info "Удаление логов..."
+        rm -rf /var/log/nginx* /var/log/apache2* /var/log/httpd* /var/log/php* /var/log/mysql* /var/log/mariadb* /var/log/exim* /var/log/dovecot* /var/log/proftpd* 2>/dev/null || true
+        
+        # Удаление пользователей и групп (осторожно, только связанные с веб-сервисами)
+        log_info "Удаление системных пользователей..."
+        userdel -r www-data 2>/dev/null || true
+        userdel -r nginx 2>/dev/null || true
+        userdel -r apache 2>/dev/null || true
+        userdel -r mysql 2>/dev/null || true
+        userdel -r dovecot 2>/dev/null || true
+        userdel -r postfix 2>/dev/null || true
+        userdel -r proftpd 2>/dev/null || true
+        
+        # Перезагрузка systemd для применения изменений
+        log_info "Перезагрузка systemd для применения изменений..."
+        $SERVICE_MANAGER daemon-reload || true
+        
+        log_success "Полная очистка компонентов стека завершена"
+    fi
+    
+    log_success "Панель управления ${PANEL_TYPE} успешно удалена"
+    
+    # Сбрасываем переменную после удаления
+    PANEL_TYPE=""
+    PANEL_INSTALLED=false
+    
+    return 0
+}
+
+perform_manual_fastpanel_cleanup() {
+    log_info "Выполняем ручное удаление FastPanel..."
+    
+    # Список служб, которые могут быть связаны с FastPanel
+    local services=("fpconfd" "fpapid" "fastpanel" "fastpanel-nginx" "fastpanel-mysql" "fastpanel-apache" "fastpanel-php")
+    
+    # Останавливаем службы
+    for service in "${services[@]}"; do
+        log_info "Останавливаем службу $service..."
+        $SERVICE_MANAGER stop $service 2>/dev/null || true
+    done
+    
+    # Удаление директорий
+    log_info "Удаление директорий FastPanel..."
+    rm -rf /usr/local/fastpanel* 2>/dev/null || true
+    rm -rf /opt/fastpanel* 2>/dev/null || true
+    rm -rf /etc/fastpanel* 2>/dev/null || true
+    rm -f /usr/bin/fpctl 2>/dev/null || true
+    
+    # Удаление системных служб
+    log_info "Удаление системных служб..."
+    for service in "${services[@]}"; do
+        rm -f /etc/systemd/system/$service.service 2>/dev/null || true
+        rm -f /usr/lib/systemd/system/$service.service 2>/dev/null || true
+    done
+    
+    # Перезагрузка systemd для применения изменений
+    log_info "Перезагрузка systemd..."
+    $SERVICE_MANAGER daemon-reload || true
+    
+    log_info "Ручное удаление FastPanel завершено"
+}
+
+#=====================================================================
 # Функции безопасности
 #=====================================================================
 
@@ -1747,6 +2509,7 @@ uninstall_stack() {
     log_success "Все компоненты успешно удалены"
 }
 
+
 #=====================================================================
 # Интерактивные функции
 #=====================================================================
@@ -1992,16 +2755,22 @@ prompt_swap() {
 
 display_banner() {
     echo -e "${GREEN}"
-    echo "  _     ______ __  __ _____    _____ _             _      "
-    echo " | |   |  ____|  \/  |  __ \  / ____| |           | |     "
-    echo " | |   | |__  | \  / | |__) || (___ | |_ __ _  ___| | __  "
-    echo " | |   |  __| | |\/| |  ___/  \___ \| __/ _\` |/ __| |/ /  "
-    echo " | |___| |____| |  | | |      ____) | || (_| | (__|   <   "
-    echo " |_____|______|_|  |_|_|     |_____/ \__\__,_|\___|_|\_\  "
+    echo "  _____                             __  __                                       "
+    echo " / ____|                           |  \/  |                                      "
+    echo "| (___   ___ _ ____   _____ _ __  | \  / | __ _ _ __   __ _  __ _  ___ _ __     "
+    echo " \___ \ / _ \ '__\ \ / / _ \ '__| | |\/| |/ _\` | '_ \ / _\` |/ _\` |/ _ \ '__|    "
+    echo " ____) |  __/ |   \ V /  __/ |    | |  | | (_| | | | | (_| | (_| |  __/ |       "
+    echo "|_____/ \___|_|    \_/ \___|_|    |_|  |_|\__,_|_| |_|\__,_|\__, |\___|_|       "
+    echo "                                                              __/ |              "
+    echo "                                                             |___/               "
     echo -e "${NC}"
-    echo "  Автоматическое развертывание LEMP/LAMP стека Pro"
-    echo "  Версия: 2.0.0"
-    echo "  ------------------------------------------------"
+    echo "  ---------------------------------------------------------------------------------"
+    echo "                Инструмент управления сервером"
+    echo "                Установка LEMP/LAMP стека и панелей управления"
+    echo "                Версия: 2.3.4"
+    echo "                Разработка Pavlovich Vladislav - pavlovich.live"
+    echo "                По вопросам функционирования и поддержки: TG @femid00"  
+    echo "  ---------------------------------------------------------------------------------"
     echo ""
 }
 
@@ -2162,9 +2931,125 @@ main() {
     # Определение ОС
     detect_os
     
-    # Проверка установленного ПО
-    prompt_operation
+    # Определяем статус установленных компонентов
+    STACK_INSTALLED=false
+    PANEL_INSTALLED=false
     
+    if detect_installed_software; then
+        STACK_INSTALLED=true
+    fi
+    
+    if detect_installed_panel; then
+        PANEL_INSTALLED=true
+    fi
+    
+    # Определяем режим работы на основе установленных компонентов
+    if $STACK_INSTALLED && $PANEL_INSTALLED; then
+        # Установлены и стек, и панель
+        echo -e "${CYAN}=== Выбор операции ===${NC}"
+        echo "Обнаружены установленный стек и панель управления: ${PANEL_TYPE}"
+        echo "1) Добавить новый сайт"
+        echo "2) Установить новый LEMP/LAMP стек (удалит существующий)"
+        echo "3) Установить новую панель управления (удалит существующую)"
+        read -p "Выберите операцию [1-3] (по умолчанию: 1): " choice
+        
+        case $choice in
+            2)
+                if prompt_yes_no "Это действие удалит существующий стек! Вы уверены?" "n"; then
+                    OPERATION="install_stack"
+                    log_info "Выбрано: Установка нового стека"
+                else
+                    OPERATION="add_site"
+                    log_info "Выбрано: Добавление нового сайта"
+                fi
+                ;;
+            3)
+                if prompt_yes_no "Это действие удалит существующую панель ${PANEL_TYPE}! Вы уверены?" "n"; then
+                    uninstall_panel
+                    OPERATION="install_panel"
+                    log_info "Выбрано: Установка новой панели управления"
+                    prompt_panel_selection
+                else
+                    OPERATION="add_site"
+                    log_info "Выбрано: Добавление нового сайта"
+                fi
+                ;;
+            *)
+                OPERATION="add_site"
+                log_info "Выбрано: Добавление нового сайта"
+                ;;
+        esac
+        
+    elif $STACK_INSTALLED; then
+        # Установлен только стек
+        echo -e "${CYAN}=== Выбор операции ===${NC}"
+        echo "1) Добавить новый сайт"
+        echo "2) Установить новый LEMP/LAMP стек (удалит существующий)"
+        echo "3) Установить панель управления сервером"
+        read -p "Выберите операцию [1-3] (по умолчанию: 1): " choice
+        
+        case $choice in
+            2)
+                if prompt_yes_no "Это действие удалит существующий стек! Вы уверены?" "n"; then
+                    OPERATION="install_stack"
+                    log_info "Выбрано: Установка нового стека"
+                else
+                    OPERATION="add_site"
+                    log_info "Выбрано: Добавление нового сайта"
+                fi
+                ;;
+            3)
+                OPERATION="install_panel"
+                log_info "Выбрано: Установка панели управления"
+                prompt_panel_selection
+                ;;
+            *)
+                OPERATION="add_site"
+                log_info "Выбрано: Добавление нового сайта"
+                ;;
+        esac
+        
+    elif $PANEL_INSTALLED; then
+        # Установлена только панель
+        echo -e "${CYAN}=== Выбор операции ===${NC}"
+        echo "Обнаружена установленная панель управления: ${PANEL_TYPE}"
+        echo "1) Установить LEMP/LAMP стек (возможны конфликты с панелью)"
+        echo "2) Установить новую панель управления (удалит существующую)"
+        read -p "Выберите операцию [1-2] (по умолчанию: 1): " choice
+        
+        case $choice in
+            2)
+                if prompt_yes_no "Это действие удалит существующую панель ${PANEL_TYPE}! Вы уверены?" "n"; then
+                    uninstall_panel
+                    OPERATION="install_panel"
+                    log_info "Выбрано: Установка новой панели управления"
+                    prompt_panel_selection
+                else
+                    OPERATION="install_stack"
+                    log_info "Выбрано: Установка стека (возможны конфликты с панелью)"
+                fi
+                ;;
+            *)
+                if prompt_yes_no "Установка стека может конфликтовать с панелью ${PANEL_TYPE}. Продолжить?" "n"; then
+                    OPERATION="install_stack"
+                    log_info "Выбрано: Установка стека"
+                else
+                    log_error "Установка отменена пользователем"
+                    exit 1
+                fi
+                ;;
+        esac
+        
+    else
+        # Ничего не установлено
+        prompt_main_selection
+    fi
+    
+    # Если выбрана установка панели - запросить её тип
+    if [[ "$OPERATION" == "install_panel" && -z "$PANEL_TYPE" ]]; then
+        prompt_panel_selection
+    fi
+
     # Ветвление логики в зависимости от выбранной операции
     if [[ "$OPERATION" == "add_site" ]]; then
         # Запрос только необходимых параметров для добавления сайта
@@ -2177,8 +3062,24 @@ main() {
         
         # Добавление сайта
         add_site
+        
+    elif [[ "$OPERATION" == "install_panel" ]]; then
+        # Отображение информации о выбранной панели
+        echo -e "${CYAN}=== Сводка настроек ===${NC}"
+        echo "Операция:          Установка панели управления"
+        echo "Панель:            ${PANEL_TYPE}"
+        echo ""
+        
+        if prompt_yes_no "Продолжить с этими настройками?" "y"; then
+            # Установка панели управления
+            install_panel
+        else
+            log_error "Установка отменена пользователем"
+            exit 1
+        fi
+        
     else
-        # Запрос параметров для полной установки
+        # Запрос параметров для полной установки стека
         prompt_web_server
         prompt_php_version
         prompt_database
@@ -2196,39 +3097,67 @@ main() {
     
     echo -e "${GREEN}Операция завершена!${NC}"
     
-    if [[ "$OPERATION" == "install" ]]; then
+    if [[ "$OPERATION" == "install_stack" ]]; then
         echo "Веб-сервер:        ${WEB_SERVER}"
         echo "Версия PHP:        ${PHP_VERSION}"
         echo "СУБД:              ${DATABASE} ${DB_VERSION}"
-    fi
-    
-    echo "Домен:             ${DOMAIN}"
-    echo "Директория сайта:  ${SITE_DIR}"
-    
-    if [[ "$CREATE_DB" == true ]]; then
-        echo -e "${YELLOW}Информация о базе данных:${NC}"
-        echo "База данных:       ${DB_NAME}"
-        echo "Пользователь БД:   ${DB_USER}"
-        echo "Пароль БД:         ${DB_PASS}"
-        echo -e "${YELLOW}ВАЖНО: Сохраните эти данные в безопасном месте!${NC}"
-    fi
-    
-    echo ""
-    echo "Вы можете просмотреть лог операции: ${LOG_FILE}"
-    echo ""
-    
-    if [[ "$DOMAIN" != "localhost" ]]; then
-        echo "Ваш сайт доступен по адресу: http://${DOMAIN}"
-        if [[ "$ENABLE_SSL" == true ]]; then
-            echo "Защищенный доступ: https://${DOMAIN}"
+        echo "Домен:             ${DOMAIN}"
+        echo "Директория сайта:  ${SITE_DIR}"
+        
+        if [[ "$CREATE_DB" == true ]]; then
+            echo -e "${YELLOW}Информация о базе данных:${NC}"
+            echo "База данных:       ${DB_NAME}"
+            echo "Пользователь БД:   ${DB_USER}"
+            echo "Пароль БД:         ${DB_PASS}"
+            echo -e "${YELLOW}ВАЖНО: Сохраните эти данные в безопасном месте!${NC}"
         fi
-    else
-        echo "Ваш сайт доступен по адресу: http://localhost"
+        
+        echo ""
+        echo "Вы можете просмотреть лог операции: ${LOG_FILE}"
+        echo ""
+        
+        if [[ "$DOMAIN" != "localhost" ]]; then
+            echo "Ваш сайт доступен по адресу: http://${DOMAIN}"
+            if [[ "$ENABLE_SSL" == true ]]; then
+                echo "Защищенный доступ: https://${DOMAIN}"
+            fi
+        else
+            echo "Ваш сайт доступен по адресу: http://localhost"
+        fi
+    elif [[ "$OPERATION" == "add_site" ]]; then
+        echo "Домен:             ${DOMAIN}"
+        echo "Директория сайта:  ${SITE_DIR}"
+        
+        if [[ "$CREATE_DB" == true ]]; then
+            echo -e "${YELLOW}Информация о базе данных:${NC}"
+            echo "База данных:       ${DB_NAME}"
+            echo "Пользователь БД:   ${DB_USER}"
+            echo "Пароль БД:         ${DB_PASS}"
+            echo -e "${YELLOW}ВАЖНО: Сохраните эти данные в безопасном месте!${NC}"
+        fi
+        
+        echo ""
+        echo "Вы можете просмотреть лог операции: ${LOG_FILE}"
+        echo ""
+        
+        if [[ "$DOMAIN" != "localhost" ]]; then
+            echo "Ваш сайт доступен по адресу: http://${DOMAIN}"
+            if [[ "$ENABLE_SSL" == true ]]; then
+                echo "Защищенный доступ: https://${DOMAIN}"
+            fi
+        else
+            echo "Ваш сайт доступен по адресу: http://localhost"
+        fi
+    elif [[ "$OPERATION" == "install_panel" ]]; then
+        echo "Панель управления: ${PANEL_TYPE}"
+        echo ""
+        echo "Вы можете просмотреть лог операции: ${LOG_FILE}"
     fi
     
     echo ""
     echo -e "${GREEN}Спасибо за использование LEMP/LAMP Stack!${NC}"
 }
+
 
 #=====================================================================
 # Дополнительная функция для удаления всего стека
@@ -2240,12 +3169,14 @@ show_help() {
     echo "Без параметров: Запуск в интерактивном режиме"
     echo ""
     echo "Опции:"
-    echo "  --uninstall    Удаление всех установленных компонентов"
+    echo "  --uninstall    Удаление всех установленных компонентов LEMP/LAMP стека"
+    echo "  --stack        Только установка LEMP/LAMP стека (без меню выбора панелей)"
+    echo "  --panel TYPE   Установка указанной панели управления (ispmanager, hestia, fastpanel, aapanel)"
     echo "  --help         Показать эту справку"
     echo ""
 }
 
-# Обработка параметров командной строки
+# Обновленная обработка параметров командной строки
 if [[ $# -gt 0 ]]; then
     case "$1" in
         --uninstall)
@@ -2257,6 +3188,19 @@ if [[ $# -gt 0 ]]; then
                 echo "Удаление отменено."
             fi
             exit 0
+            ;;
+        --stack)
+            OPERATION="install_stack"
+            ;;
+        --panel)
+            OPERATION="install_panel"
+            if [[ -n "$2" && ("$2" == "ispmanager" || "$2" == "hestia" || "$2" == "fastpanel" || "$2" == "aapanel") ]]; then
+                PANEL_TYPE="$2"
+            else
+                echo "Укажите тип панели: ispmanager, hestia, fastpanel или aapanel"
+                echo "Например: $0 --panel hestia"
+                exit 1
+            fi
             ;;
         --help)
             show_help
